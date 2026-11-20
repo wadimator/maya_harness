@@ -1,0 +1,15 @@
+#!/bin/sh
+#
+# `just check` without the tests. Only uv is needed, not just. It inspects the working tree,
+# not the index: before a merge run `just check` on a clean tree.
+set -e
+
+command -v uv >/dev/null 2>&1 || {
+	printf >&2 "\n%s\n\n" "pre-commit: uv not found on PATH. Install uv, or skip this hook once with 'git commit --no-verify'."
+	exit 1
+}
+
+uv lock --check
+uv run --frozen --exact ruff format --check .
+uv run --frozen --exact ruff check .
+uv run --frozen --exact mypy

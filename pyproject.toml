@@ -1,0 +1,48 @@
+[project]
+name = "maya-harness"
+version = "0.1.0"
+description = "An isolated GUI Maya for plugin development: start, run code, look, stop"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11.4,<3.12"
+# Standard library only: the package runs on the host Python of any plugin's .venv.
+dependencies = []
+
+[project.scripts]
+maya-harness = "maya_harness.cli:main"
+
+[dependency-groups]
+dev = [
+    "ruff==0.16.6",
+    "pytest==9.1.1",
+    "mypy==2.3.1",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.0,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+default-groups = ["dev"]
+python-downloads = "never"
+python-preference = "only-system"
+# One uv minor per project, as in the plugins: out of range, every uv command fails at once.
+required-version = ">=0.12.0,<0.13.0"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --import-mode=importlib"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["maya_harness"]
+mypy_path = "src"
