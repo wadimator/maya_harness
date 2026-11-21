@@ -8,6 +8,8 @@
 * `maya-harness exec -c "<код>"` — выполнить код в ней и напечатать результат;
 * `maya-harness status` — какие Maya запущены;
 * `maya-harness stop` — закрыть;
+* `maya-harness run <сценарии | all>` — прогнать сценарии проверок плагина в нескольких Maya
+  сразу ([docs/scenarios.md](docs/scenarios.md));
 * `maya-harness doctor` — готова ли машина.
 
 Код выполняется через [dcc-mcp-maya](https://github.com/dcc-mcp/dcc-mcp-maya), MCP-сервер внутри
@@ -56,7 +58,11 @@ project = "UE_exporter"           # имя в status и в каталоге се
 sys_path = ["..", "vendor"]       # относительно корня проекта; первыми в sys.path Maya
 plugins = ["fbxmaya"]             # плагины Maya, загружаемые при старте
 plug_in_path = ["maya_plugins"]   # MAYA_PLUG_IN_PATH: свои плагины Maya проекта
-reload = ["UE_exporter"]          # пакеты, которые exec --reload выгружает из sys.modules
+reload = ["UE_exporter"]          # пакеты, которые exec --reload и run выгружают из sys.modules
+
+[tool.maya_harness.scenarios]     # только для run; нужны оба ключа
+dir = "dev_tools/maya_checks"     # сценарии check_*.py
+runs = "dev_tools/maya_checks/runs.toml"  # таблица прогонов: что гонит run all
 ```
 
 `sys_path` и `plugins` запоминаются при `start`: правка настроек действует со следующего
@@ -70,6 +76,7 @@ reload = ["UE_exporter"]          # пакеты, которые exec --reload �
 | `exec [URL] (-c КОД \| -f ФАЙЛ) [--reload] [--json]` | выполнить код; печатает stdout, stderr и значение последнего выражения, если код им кончается. Без URL — последняя запущенная Maya этого корня проекта (worktree — другой корень, своя Maya). `--reload` — сначала выгрузить пакеты из `reload` |
 | `status [--json]` | все Maya maya_harness этого пользователя: проект, pid, адрес, возраст, простой |
 | `stop [URL \| --project \| --all-mine]` | закрыть последнюю Maya этого проекта, Maya по адресу, все Maya проекта или все свои. Maya, не принявшую `quit` за 60 с, — убить, если pid по-прежнему её |
+| `run (СЦЕНАРИИ \| all) [ПАРАМЕТР=ЗНАЧЕНИЕ] [--jobs N] [--url URL] [--visible] [--json]` | прогнать сценарии в своих Maya (`--jobs`, 3 по умолчанию) или по очереди в Maya по адресу; `ПАРАМЕТР` — `control` или `section` одного сценария. Отчёт каждого прогона и сводка; `--json` — сводка одной строкой, отчёты в stderr. Сценарии и контроли — [docs/scenarios.md](docs/scenarios.md) |
 | `doctor` | Maya, `.mod`, пути в нём, версия модуля; патч DCC_MCP — если `MAYA_HARNESS_DCC_MCP_PATCH` указывает на клон DCC_MCP |
 
 Коды возврата: `0` — успех; `1` — код упал или проверка не прошла; `2` — ничего не запущено
