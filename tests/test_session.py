@@ -142,7 +142,8 @@ def test_environment_drops_what_points_maya_and_python_at_code() -> None:
     assert "PYTHONSTARTUP" not in env
     assert "VIRTUAL_ENV" not in env
     assert env["MAYA_MODULE_PATH"] == str(Path("C:/s/modules"))
-    assert env["PYTHONPATH"] == os.pathsep.join([str(Path("C:/project/src")), str(Path("C:/project/vendor"))])
+    project_paths = [str(Path("C:/project/src")), str(Path("C:/project/vendor"))]
+    assert env["PYTHONPATH"] == os.pathsep.join([*project_paths, str(Path("C:/s/pylib"))])
     assert env["MAYA_PLUG_IN_PATH"] == str(Path("C:/project/maya_plugins"))
 
 
@@ -171,10 +172,20 @@ def test_environment_sets_the_session() -> None:
         assert env[name] == "1"
 
 
-def test_environment_without_paths_sets_none() -> None:
+def test_environment_without_paths_has_only_the_package_copy() -> None:
     env = session.environment(BASE, Path("C:/s"), SessionParams(PROJECT, Path("C:/p")), 1)
-    assert "PYTHONPATH" not in env
+    assert env["PYTHONPATH"] == str(Path("C:/s/pylib"))
     assert "MAYA_PLUG_IN_PATH" not in env
+
+
+def test_prepare_copies_the_package_for_the_code_in_maya(tmp_path: Path) -> None:
+    module = tmp_path / "dcc_mcp_maya.mod"
+    module.write_text("+ MAYAVERSION:2025 PLATFORM:win64 dcc_mcp_maya 0.9.43 C:/m\n", encoding="utf-8")
+    root = tmp_path / "session"
+    env = session.prepare(root, SessionParams(PROJECT, tmp_path), module, {}, 1)
+    copy = Path(env["PYTHONPATH"]) / "maya_harness"
+    assert (copy / "inmaya.py").read_bytes() == (Path(session.__file__).parent / "inmaya.py").read_bytes()
+    assert not list(copy.rglob("__pycache__"))
 
 
 def test_user_setup_loads_project_plugins_then_dcc_mcp() -> None:

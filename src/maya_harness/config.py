@@ -8,6 +8,10 @@ sys_path = ["..", "vendor"]     # relative to the project root; first on Maya's 
 plugins = ["fbxmaya"]           # Maya plugins loaded on startup, before dcc-mcp
 plug_in_path = ["maya_plugins"] # MAYA_PLUG_IN_PATH, relative to the project root
 reload = ["UE_exporter"]        # top packages dropped from sys.modules by `exec --reload`
+
+[tool.maya_harness.scenarios]   # for `run`; both keys are needed
+dir = "dev_tools/maya_checks"   # the check_*.py scenarios; first on Maya's sys.path at a run
+runs = "dev_tools/maya_checks/runs.toml"  # what `run all` runs: see run.py
 ```
 
 Without a `pyproject.toml` the project is the directory itself, with nothing to add to Maya.
@@ -22,11 +26,20 @@ from pathlib import Path
 
 from .session import SessionParams
 
-KNOWN = ("project", "sys_path", "plugins", "plug_in_path", "reload")
+KNOWN = ("project", "sys_path", "plugins", "plug_in_path", "reload", "scenarios")
+SCENARIO_KEYS = ("dir", "runs")
 
 
 class ConfigError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class Scenarios:
+    """`[tool.maya_harness.scenarios]`: the directory of the scenarios and the table of the runs."""
+
+    dir: Path
+    runs: Path
 
 
 @dataclass(frozen=True)
@@ -37,6 +50,7 @@ class Config:
     plugins: tuple[str, ...] = ()
     plug_in_path: tuple[Path, ...] = ()
     reload: tuple[str, ...] = ()
+    scenarios: Scenarios | None = None
 
     def params(self) -> SessionParams:
         return SessionParams(self.project, self.root, self.sys_path, self.plugins, self.plug_in_path)
@@ -55,6 +69,17 @@ def _strings(section: dict[str, object], key: str, pyproject: Path) -> tuple[str
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ConfigError(f"{pyproject}: [tool.maya_harness].{key} must be a list of strings")
     return tuple(value)
+
+
+def _scenarios(section: dict[str, object], root: Path, pyproject: Path) -> Scenarios | None:
+    value = section.get("scenarios")
+    if value is None:
+        return None
+    if not isinstance(value, dict) or sorted(value) != sorted(SCENARIO_KEYS):
+        raise ConfigError(f"{pyproject}: [tool.maya_harness.scenarios] takes exactly {', '.join(SCENARIO_KEYS)}")
+    if not all(isinstance(value[key], str) for key in SCENARIO_KEYS):
+        raise ConfigError(f"{pyproject}: [tool.maya_harness.scenarios] {', '.join(SCENARIO_KEYS)} must be strings")
+    return Scenarios(dir=(root / value["dir"]).resolve(), runs=(root / value["runs"]).resolve())
 
 
 def load(start: Path) -> Config:
@@ -84,4 +109,5 @@ def load(start: Path) -> Config:
         plugins=_strings(section, "plugins", pyproject),
         plug_in_path=tuple((root / path).resolve() for path in _strings(section, "plug_in_path", pyproject)),
         reload=_strings(section, "reload", pyproject),
+        scenarios=_scenarios(section, root, pyproject),
     )

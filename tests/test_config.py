@@ -61,3 +61,27 @@ def test_no_pyproject_is_the_directory_itself(tmp_path: Path) -> None:
     assert config.project == "loose"
     assert config.root == root.resolve()
     assert config.sys_path == ()
+
+
+def test_scenarios_are_paths_from_the_root(tmp_path: Path) -> None:
+    root = write(
+        tmp_path / "plugin",
+        '[tool.maya_harness.scenarios]\ndir = "dev_tools/checks"\nruns = "dev_tools/checks/runs.toml"\n',
+    )
+    scenarios = load(root).scenarios
+    assert scenarios is not None
+    assert (scenarios.dir, scenarios.runs) == (
+        (root / "dev_tools" / "checks").resolve(),
+        (root / "dev_tools" / "checks" / "runs.toml").resolve(),
+    )
+    assert load(write(tmp_path / "bare", "[tool.maya_harness]\n")).scenarios is None
+
+
+@pytest.mark.parametrize(
+    "table",
+    ['dir = "checks"\n', 'dir = "checks"\nruns = "r.toml"\nprefix = "check_"\n', 'dir = "checks"\nruns = 1\n'],
+)
+def test_scenarios_take_dir_and_runs_only(tmp_path: Path, table: str) -> None:
+    root = write(tmp_path, f"[tool.maya_harness.scenarios]\n{table}")
+    with pytest.raises(ConfigError, match=r"\[tool.maya_harness.scenarios\]"):
+        load(root)

@@ -21,9 +21,9 @@ from pathlib import Path
 from typing import Any
 
 from . import config, process, session, transport
+from . import run as scenario_run
 from .session import Session, State
 
-STARTUP_TIMEOUT = 180  # seconds; a cold start takes 12-15
 CALL_TIMEOUT = 900  # seconds per `exec`
 QUIT_TIMEOUT = 60  # seconds for a quitting Maya to exit
 DEFAULT_TTL = 60  # minutes
@@ -73,6 +73,20 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--reload", action="store_true", help="drop the project's packages from sys.modules first")
     run.add_argument("--json", action="store_true")
 
+    scenarios = commands.add_parser(
+        "run", help="run check scenarios in Mayas of their own", epilog="See docs/scenarios.md."
+    )
+    scenarios.add_argument("items", nargs="+", help="scenario names or all, and name=value parameters")
+    scenarios.add_argument(
+        "--jobs",
+        type=int,
+        default=scenario_run.JOBS,
+        help=f"Mayas at once, {scenario_run.JOBS} by default; one with --visible",
+    )
+    scenarios.add_argument("--url", help="run in this Maya, which `start` left running")
+    scenarios.add_argument("--visible", action="store_true", help="start the Maya on the usual desktop")
+    scenarios.add_argument("--json", action="store_true", help="the summary as one JSON line; the reports go to stderr")
+
     commands.add_parser("doctor", help="check Maya, the dcc-mcp module and its patch")
     return main
 
@@ -81,10 +95,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):  # redirected to a file, they would write cp1251
         stream.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
     args = parser().parse_args(argv)
-    commands = {"start": start, "stop": stop, "status": status, "exec": run, "doctor": doctor}
+    commands = {"start": start, "stop": stop, "status": status, "exec": run, "run": run_scenarios, "doctor": doctor}
     try:
         return commands[args.command](args)
-    except (NotRun, config.ConfigError, transport.TransportError, TimeoutError, OSError) as error:
+    except (
+        NotRun,
+        config.ConfigError,
+        scenario_run.Refused,
+        transport.TransportError,
+        TimeoutError,
+        OSError,
+    ) as error:
         if getattr(args, "json", False):
             print(json.dumps({"success": False, "error": str(error)}, ensure_ascii=False))
         else:
@@ -95,14 +116,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 130
 
 
-def start(args: argparse.Namespace) -> int:
-    project = config.load(Path.cwd())
+def maya_and_module() -> tuple[Path, Path]:
+    """`maya.exe` and the dcc-mcp `.mod` a new session needs."""
     maya_exe = session.maya_exe(os.environ)
     if not maya_exe.is_file():
         raise NotRun(f"no Maya at {maya_exe}; set MAYAPY_EXE or MAYA_LOCATION")
     module = session.module_file(os.environ)
     if not module.is_file():
         raise NotRun(f"no dcc-mcp-maya module at {module}; set {session.MODULE_VARIABLE} to its .mod file")
+    return maya_exe, module
+
+
+def start(args: argparse.Namespace) -> int:
+    project = config.load(Path.cwd())
+    maya_exe, module = maya_and_module()
     if args.ttl < 0:
         raise NotRun("--ttl takes 0 or more minutes")
 
@@ -122,8 +149,8 @@ def start(args: argparse.Namespace) -> int:
         )
         session.write_state(root, state)
         try:
-            transport.wait_for_server(url, work, maya.running, STARTUP_TIMEOUT)
-            transport.connect(url, STARTUP_TIMEOUT, work)
+            transport.wait_for_server(url, work, maya.running, transport.STARTUP_TIMEOUT)
+            transport.connect(url, transport.STARTUP_TIMEOUT, work)
         except (transport.TransportError, TimeoutError, OSError) as error:
             titles = maya.window_titles() if maya.running() else []
             logs = [str(log) for log in transport.server_logs(maya.pid)]
@@ -168,17 +195,12 @@ def reload_code(packages: Sequence[str]) -> str:
     )
 
 
-def touch(work: Path) -> None:
-    """Marks a call: the idle timer of the session counts from the mtime of `last_call`."""
-    (work / "last_call").touch()
-
-
 def run(args: argparse.Namespace) -> int:
     code = args.code if args.code is not None else args.file.read_text(encoding="utf-8")
     url, target = select(args.url)
     packages = config.load(Path.cwd()).reload if args.reload else ()
     work = transport.connect(url, CALL_TIMEOUT, target.work if target else None)
-    touch(work)
+    session.touch(work)
     try:
         # A call of its own, not a prefix of the code: `from __future__` must open the code, and
         # the line numbers of its traceback must be the file's.
@@ -188,7 +210,7 @@ def run(args: argparse.Namespace) -> int:
     except OSError as error:  # a timeout, a reset: the code reached Maya and may have run
         result = transport.Result(False, type(error).__name__, stderr=f"no reply from {url}: {error}")
     finally:
-        touch(work)
+        session.touch(work)
     if args.json:
         fields = ("success", "error", "stdout", "stderr", "output")
         print(json.dumps({name: getattr(result, name) for name in fields} | {"url": url}, ensure_ascii=False))
@@ -203,6 +225,43 @@ def run(args: argparse.Namespace) -> int:
         elif result.output:
             print(result.output)
     return OK if result.success else FAILED
+
+
+def run_scenarios(args: argparse.Namespace) -> int:
+    project = config.load(Path.cwd())
+    if project.scenarios is None:
+        raise NotRun(f"no [tool.maya_harness.scenarios] in the pyproject.toml of {project.root}")
+    runs = scenario_run.parse(args.items, scenario_run.load_runs(project.scenarios.runs))
+    scenario_run.refuse_unknown(runs, project.scenarios)
+    if args.jobs < 1:
+        raise NotRun("--jobs takes 1 or more")
+    if args.jobs > scenario_run.MAX_JOBS:
+        print(f"--jobs {args.jobs}: more than {scenario_run.MAX_JOBS} Mayas slow each other down.", file=sys.stderr)
+    codes = [scenario_run.code_of(item, project.scenarios.dir, project.reload) for item in runs]
+    out = sys.stderr if args.json else sys.stdout
+    if args.url:
+        work = transport.connect(args.url, CALL_TIMEOUT)
+        outcomes = scenario_run.run_at_url(args.url, work, runs, codes, out)
+    else:
+        maya_exe, module = maya_and_module()
+        count = 1 if args.visible else max(1, min(args.jobs, len(runs)))
+        pool = scenario_run.run_in_pool(
+            project,
+            runs,
+            codes,
+            count,
+            args.visible,
+            lambda env, visible, number: process.MayaProcess(maya_exe, env, visible, number),
+            module,
+            temp_dir(),
+            out,
+        )
+        if not pool.ready:
+            raise NotRun("no Maya started; see the errors above")
+        outcomes = pool.outcomes
+    if args.json:
+        print(json.dumps(scenario_run.summary(runs, outcomes), ensure_ascii=False))
+    return OK if scenario_run.passed(runs, outcomes) else FAILED
 
 
 def stop(args: argparse.Namespace) -> int:
