@@ -1,5 +1,6 @@
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,11 @@ def alive(pid: int) -> bool:
     return pid in (ALIVE, OTHER_ALIVE)
 
 
-def make_dir(temp: Path, runner_pid: object, maya_pid: object, *, age: float = 0.0) -> Path:
+def maya(pid: int, created: int) -> bool:
+    return alive(pid)
+
+
+def make_dir(temp: Path, runner_pid: object, maya_pid: object, *, age: float = 0.0, created: int = 0) -> Path:
     root = temp / f"{session.PREFIX}{PROJECT}_{DEAD}_abc{runner_pid}{maya_pid}"
     root.mkdir()
     state = {
@@ -28,13 +33,15 @@ def make_dir(temp: Path, runner_pid: object, maya_pid: object, *, age: float = 0
         "started": NOW,
         "ttl": 60,
     }
+    if created:  # without it, state.json is one from before the creation time
+        state["maya_created"] = created
     (root / session.STATE_FILE).write_text(json.dumps(state), encoding="utf-8")
     os.utime(root, (NOW - age, NOW - age))
     return root
 
 
 def remove(temp: Path) -> list[Path]:
-    return session.remove_stale(temp, alive=alive, now=lambda: NOW)
+    return session.remove_stale(temp, alive=alive, now=lambda: NOW, maya=maya)
 
 
 def test_dead_runner_and_dead_maya_is_removed(tmp_path: Path) -> None:
@@ -84,11 +91,25 @@ def test_sessions_lists_live_mayas_oldest_first(tmp_path: Path) -> None:
     state = json.loads((second / session.STATE_FILE).read_text(encoding="utf-8"))
     state["started"] = NOW + 1
     (second / session.STATE_FILE).write_text(json.dumps(state), encoding="utf-8")
-    assert [found.root for found in session.sessions(tmp_path, alive=alive)] == [first, second]
+    assert [found.root for found in session.sessions(tmp_path, maya=maya)] == [first, second]
+    assert session.read_state(first).maya_created == 0
+
+
+def test_a_maya_pid_counts_only_with_its_creation_time(tmp_path: Path) -> None:
+    """Windows reuses pids: the recorded creation time goes along with the Maya pid."""
+    root = make_dir(tmp_path, DEAD, ALIVE, created=7)
+
+    def created_at(time: int) -> Callable[[int, int], bool]:
+        return lambda pid, created: alive(pid) and created == time
+
+    assert [found.root for found in session.sessions(tmp_path, maya=created_at(7))] == [root]
+    assert session.sessions(tmp_path, maya=created_at(8)) == []
+    assert session.remove_stale(tmp_path, alive=alive, now=lambda: NOW, maya=created_at(7)) == []
+    assert session.remove_stale(tmp_path, alive=alive, now=lambda: NOW, maya=created_at(8)) == [root]
 
 
 def test_state_round_trip(tmp_path: Path) -> None:
-    state = State(PROJECT, "C:/x", 1, 2, "http://127.0.0.1:1/mcp", NOW, 60)
+    state = State(PROJECT, "C:/x", 1, 2, "http://127.0.0.1:1/mcp", NOW, 60, 134_000_000_000_000_000)
     session.write_state(tmp_path, state)
     assert session.read_state(tmp_path) == state
 

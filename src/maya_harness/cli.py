@@ -117,7 +117,9 @@ def start(args: argparse.Namespace) -> int:
         maya = process.MayaProcess(maya_exe, env, args.visible)
         for log in transport.server_logs(maya.pid):
             log.unlink(missing_ok=True)
-        state = State(project.project, str(project.root), os.getpid(), maya.pid, url, time.time(), args.ttl)
+        state = State(
+            project.project, str(project.root), os.getpid(), maya.pid, url, time.time(), args.ttl, maya.created
+        )
         session.write_state(root, state)
         try:
             transport.wait_for_server(url, work, maya.running, STARTUP_TIMEOUT)
@@ -231,9 +233,11 @@ def stop(args: argparse.Namespace) -> int:
     while left and time.monotonic() < deadline:
         left = [item for item in left if process.process_alive(item.state.maya_pid)]
         time.sleep(0.25)
-    running = left + unreachable
+    killed = [item for item in left + unreachable if process.kill_maya(item.state.maya_pid, item.state.maya_created)]
+    running = [item for item in left + unreachable if item not in killed]
     for item in targets:
-        print(f"Maya {item.state.maya_pid} at {item.state.url}: {'still running' if item in running else 'closed'}")
+        outcome = "still running" if item in running else "killed" if item in killed else "closed"
+        print(f"Maya {item.state.maya_pid} at {item.state.url}: {outcome}")
     return FAILED if running else OK
 
 

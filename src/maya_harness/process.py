@@ -5,7 +5,8 @@
 * The job kills Maya, and everything Maya started, when its handle closes: on an error, on
   Ctrl+C and when the harness itself is killed. Not a `quit`: the settings of this Maya are thrown
   away with its directory, and a kill does not hang on a modal dialog. A Maya left running by
-  `release` is out of the job; it is closed by a deferred `quit` instead.
+  `release` is out of the job; it is closed by a deferred `quit` instead, and a Maya that does
+  not take it `stop` kills, once its image and creation time show the pid is still that Maya.
 * The job runs Maya below normal priority and, on more than 8 logical CPUs, off the first
   `SPARED_CPUS` of them: the PC stays usable while Maya works.
 * Maya is created suspended and put in the job before its first instruction: nothing it starts
@@ -33,6 +34,8 @@ kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 CREATE_SUSPENDED = 0x4
 CREATE_UNICODE_ENVIRONMENT = 0x400
 GENERIC_ALL = 0x10000000
+PROCESS_TERMINATE = 0x1
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 SYNCHRONIZE = 0x100000
 WAIT_TIMEOUT = 0x102
 JOB_OBJECT_LIMIT_AFFINITY = 0x10
@@ -144,6 +147,14 @@ kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
 kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE, *[ctypes.POINTER(wintypes.FILETIME)] * 4]
+kernel32.QueryFullProcessImageNameW.argtypes = [
+    wintypes.HANDLE,
+    wintypes.DWORD,
+    wintypes.LPWSTR,
+    ctypes.POINTER(wintypes.DWORD),
+]
+kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
 
 
 def _checked(result: object) -> object:
@@ -200,6 +211,7 @@ class MayaProcess:
             )
         )
         self.handle, self.pid = process.hProcess, int(process.dwProcessId)
+        self.created = creation_time(self.handle)
         _checked(kernel32.AssignProcessToJobObject(self.job, self.handle))
         kernel32.ResumeThread(process.hThread)
         kernel32.CloseHandle(process.hThread)
@@ -261,6 +273,69 @@ class MayaProcess:
         kernel32.CloseHandle(self.handle)
         if self.desktop:
             user32.CloseDesktop(self.desktop)
+
+
+def creation_time(handle: object) -> int:
+    """When the process was created, in 100 ns FILETIME units: with the pid, it names the process."""
+    created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+    _checked(
+        kernel32.GetProcessTimes(
+            handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)
+        )
+    )
+    return (created.dwHighDateTime << 32) | created.dwLowDateTime
+
+
+def image_name(handle: object) -> str:
+    size = wintypes.DWORD(32768)
+    name = ctypes.create_unicode_buffer(size.value)
+    _checked(kernel32.QueryFullProcessImageNameW(handle, 0, name, ctypes.byref(size)))
+    return name.value
+
+
+def is_our_maya(image: str, created: int, recorded: int) -> bool:
+    """Windows reuses pids: a pid names our Maya only together with its image and creation time."""
+    return Path(image).name.lower() == "maya.exe" and created == recorded
+
+
+def kill_maya(pid: int, recorded: int) -> bool:
+    """Kills our Maya `pid`; True once it is gone. Our Maya always opens for us: a pid that does
+    not, or that names another process now, means it is gone already."""
+    handle = kernel32.OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, pid)
+    if not handle:
+        return True
+    try:
+        try:
+            ours = is_our_maya(image_name(handle), creation_time(handle), recorded)
+        except OSError:  # exited, though someone still holds a handle: no image name (WinError 31)
+            return bool(kernel32.WaitForSingleObject(handle, 0) == 0)
+        if not recorded:  # a state.json from before the creation time: cannot tell
+            return False
+        if not ours:
+            return True  # the pid names another process now
+        kernel32.TerminateProcess(handle, 1)  # unchecked: a process already exiting refuses
+        return bool(kernel32.WaitForSingleObject(handle, EXIT_TIMEOUT * 1000) == 0)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def maya_alive(pid: int, recorded: int) -> bool:
+    """Our Maya `pid` still runs. Windows reuses pids: with a recorded creation time, a pid that
+    names another process now is not our Maya; without one (an old state.json), the pid decides."""
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, pid)
+    if not handle:
+        return False
+    try:
+        if kernel32.WaitForSingleObject(handle, 0) != WAIT_TIMEOUT:
+            return False
+        if not recorded:
+            return True
+        try:
+            return is_our_maya(image_name(handle), creation_time(handle), recorded)
+        except OSError:
+            return False
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def process_alive(pid: int) -> bool:

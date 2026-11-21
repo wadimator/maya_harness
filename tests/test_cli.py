@@ -154,6 +154,7 @@ def test_stop_goes_on_past_a_maya_that_does_not_answer(monkeypatch: pytest.Monke
     monkeypatch.setattr(transport, "connect", connect)
     monkeypatch.setattr(transport, "execute", execute)
     monkeypatch.setattr(process, "process_alive", lambda pid: False)
+    monkeypatch.setattr(process, "kill_maya", lambda pid, created: False)
     assert cli.main(["stop", "--all-mine"]) == cli.FAILED
     assert quit_sent == [other.state.url]
 

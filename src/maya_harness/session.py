@@ -44,7 +44,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from .process import process_alive
+from .process import maya_alive, process_alive
 
 PREFIX = "maya_harness_"
 STATE_FILE = "state.json"
@@ -127,6 +127,7 @@ class State:
     url: str
     started: float
     ttl: int = 0
+    maya_created: int = 0
 
 
 @dataclass(frozen=True)
@@ -196,6 +197,7 @@ def read_state(root: Path) -> State | None:
             url=str(data["url"]),
             started=float(data["started"]),
             ttl=int(data.get("ttl", 0)),
+            maya_created=int(data.get("maya_created", 0)),
         )
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         return None
@@ -210,7 +212,10 @@ def write_state(root: Path, state: State) -> None:
 
 
 def remove_stale(
-    temp: Path, alive: Callable[[int], bool] = process_alive, now: Callable[[], float] = time.time
+    temp: Path,
+    alive: Callable[[int], bool] = process_alive,
+    now: Callable[[], float] = time.time,
+    maya: Callable[[int, int], bool] = maya_alive,
 ) -> list[Path]:
     """Removes the session directories nobody holds; returns them."""
     removed = []
@@ -225,19 +230,19 @@ def remove_stale(
                 continue
             if fresh:
                 continue
-        elif alive(state.runner_pid) or alive(state.maya_pid):
+        elif alive(state.runner_pid) or maya(state.maya_pid, state.maya_created):
             continue
         shutil.rmtree(root, ignore_errors=True)
         removed.append(root)
     return removed
 
 
-def sessions(temp: Path, alive: Callable[[int], bool] = process_alive) -> list[Session]:
+def sessions(temp: Path, maya: Callable[[int, int], bool] = maya_alive) -> list[Session]:
     """The sessions whose Maya is alive, the latest started last."""
     found = []
     for root in temp.glob(f"{PREFIX}*"):
         state = read_state(root) if root.is_dir() else None
-        if state is not None and alive(state.maya_pid):
+        if state is not None and maya(state.maya_pid, state.maya_created):
             found.append(Session(root, state))
     return sorted(found, key=lambda session: session.state.started)
 
