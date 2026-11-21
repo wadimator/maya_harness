@@ -205,10 +205,10 @@ def execute(url: str, code: str, timeout: float) -> Result:
         time.sleep(BUSY_RETRY)
 
 
-def connect(url: str, timeout: float, work: Path | None = None) -> None:
+def connect(url: str, timeout: float, work: Path | None = None) -> Path:
     """The handshake, then the marker: a session's Maya holds its work directory there, and the
     Maya a session started must hold its own one — a port another Maya took would run the code
-    there."""
+    there. Returns the work directory of that Maya."""
     call(
         url,
         "initialize",
@@ -225,3 +225,4 @@ def connect(url: str, timeout: float, work: Path | None = None) -> None:
         raise TransportError(f"{url} is not a Maya started by maya_harness: nothing is run there.")
     if work is not None and marker != str(work):
         raise TransportError(f"{url} is another Maya of maya_harness: its marker is {marker}, not {work}.")
+    return Path(marker)

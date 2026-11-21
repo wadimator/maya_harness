@@ -113,7 +113,7 @@ def start(args: argparse.Namespace) -> int:
     maya: process.MayaProcess | None = None
     kept = False
     try:
-        env = session.prepare(root, project.params(), module, os.environ, port)
+        env = session.prepare(root, project.params(), module, os.environ, port, args.ttl)
         maya = process.MayaProcess(maya_exe, env, args.visible)
         for log in transport.server_logs(maya.pid):
             log.unlink(missing_ok=True)
@@ -166,11 +166,17 @@ def reload_code(packages: Sequence[str]) -> str:
     )
 
 
+def touch(work: Path) -> None:
+    """Marks a call: the idle timer of the session counts from the mtime of `last_call`."""
+    (work / "last_call").touch()
+
+
 def run(args: argparse.Namespace) -> int:
     code = args.code if args.code is not None else args.file.read_text(encoding="utf-8")
     url, target = select(args.url)
     packages = config.load(Path.cwd()).reload if args.reload else ()
-    transport.connect(url, CALL_TIMEOUT, target.work if target else None)
+    work = transport.connect(url, CALL_TIMEOUT, target.work if target else None)
+    touch(work)
     try:
         # A call of its own, not a prefix of the code: `from __future__` must open the code, and
         # the line numbers of its traceback must be the file's.
@@ -179,6 +185,8 @@ def run(args: argparse.Namespace) -> int:
             result = transport.execute(url, code, CALL_TIMEOUT)
     except OSError as error:  # a timeout, a reset: the code reached Maya and may have run
         result = transport.Result(False, type(error).__name__, stderr=f"no reply from {url}: {error}")
+    finally:
+        touch(work)
     if args.json:
         fields = ("success", "error", "stdout", "stderr", "output")
         print(json.dumps({name: getattr(result, name) for name in fields} | {"url": url}, ensure_ascii=False))

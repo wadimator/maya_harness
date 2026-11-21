@@ -20,6 +20,12 @@
   `DCC_MCP_GATEWAY_PORT=0` keep this Maya out of the user's dcc-mcp gateway.
 * The Maya is marked by `MAYA_HARNESS_WORK`, its work directory: the harness runs code only in
   a Maya with the marker, and an artist's Maya has none.
+* A Maya left running and forgotten lives on a hidden desktop, where nobody can close it by
+  hand: `userSetup.py` starts a timer that quits Maya after `MAYA_HARNESS_TTL` idle minutes.
+  Idle is the age of `work/last_call`, which `exec` touches before and after its call: the timer
+  is on Maya's main thread and is silent while a call runs there, so without the touch after
+  the call a call longer than the TTL would be followed by a quit at once. Qt runs the timer
+  inside a modal dialog's loop too: a Maya stuck on a dialog still quits.
 * `userSetup.py` turns off the userSetup checksum: otherwise `quit` stops at the modal «Secure
   UserSetup Checksum verification», since `userSetup.py` is new in every session. A
   `userPrefs.mel` written in advance does not do it: Maya's first start in a new settings
@@ -58,6 +64,35 @@ import maya.cmds as cmds
 _status = Path(os.environ["MAYA_HARNESS_WORK"]) / "startup.txt"
 _status.write_text("userSetup.py loaded", encoding="utf-8")
 cmds.optionVar(intValue=("SafeModeUserSetupHashOption", 0))
+
+_last_call = Path(os.environ["MAYA_HARNESS_WORK"]) / "last_call"
+_last_call.touch()
+_ttl = int(os.environ.get("MAYA_HARNESS_TTL") or 0)
+
+
+def _maya_harness_quit_when_idle():
+    import time
+
+    try:
+        idle = time.time() - _last_call.stat().st_mtime
+    except OSError:
+        return
+    if idle > _ttl * 60:
+        cmds.quit(force=True)
+
+
+def _maya_harness_start_idle_timer():
+    import __main__
+    from PySide6.QtCore import QTimer
+
+    timer = QTimer()
+    timer.timeout.connect(_maya_harness_quit_when_idle)
+    timer.start(60 * 1000)
+    __main__._maya_harness_idle_timer = timer  # a timer nobody holds is collected and stops
+
+
+if _ttl > 0:
+    cmds.evalDeferred(_maya_harness_start_idle_timer)
 
 try:
     for _plugin in {plugins!r}:
@@ -212,8 +247,8 @@ def make_session_dir(project: str, temp: Path) -> Path:
     return Path(tempfile.mkdtemp(prefix=f"{PREFIX}{project}_{os.getpid()}_", dir=temp))
 
 
-def environment(base: Mapping[str, str], root: Path, params: SessionParams, port: int) -> dict[str, str]:
-    """The environment of the session's Maya: see the module docstring."""
+def environment(base: Mapping[str, str], root: Path, params: SessionParams, port: int, ttl: int = 0) -> dict[str, str]:
+    """The environment of the session's Maya: see the module docstring. `ttl` is in minutes, 0 for none."""
     env = {
         name: value
         for name, value in base.items()
@@ -233,6 +268,7 @@ def environment(base: Mapping[str, str], root: Path, params: SessionParams, port
         DCC_MCP_MAYA_PORT=str(port),
         DCC_MCP_MAYA_BOOTSTRAP_LOG=str(work / "dcc_mcp_bootstrap.jsonl"),
         PYTHONUTF8="1",
+        MAYA_HARNESS_TTL=str(ttl),
         **{MARKER: str(work), PROJECT_VARIABLE: params.project},
     )
     if params.sys_path:
@@ -247,7 +283,9 @@ def user_setup(plugins: tuple[str, ...]) -> str:
     return USER_SETUP.format(plugins=(*plugins, "dcc_mcp_maya_plugin"))
 
 
-def prepare(root: Path, params: SessionParams, module: Path, base: Mapping[str, str], port: int) -> dict[str, str]:
+def prepare(
+    root: Path, params: SessionParams, module: Path, base: Mapping[str, str], port: int, ttl: int = 0
+) -> dict[str, str]:
     """Fills `root` with the session's settings; returns the environment its Maya starts with."""
     scripts = root / "app" / "2025" / "scripts"
     scripts.mkdir(parents=True)
@@ -257,4 +295,4 @@ def prepare(root: Path, params: SessionParams, module: Path, base: Mapping[str, 
     shutil.copy(module, modules / module.name)  # its paths are absolute
     (root / "work").mkdir()
     (root / "appdata").mkdir()
-    return environment(base, root, params, port)
+    return environment(base, root, params, port, ttl)

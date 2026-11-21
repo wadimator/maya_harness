@@ -84,6 +84,28 @@ def test_missing_maya_exits_with_2(
     assert "no Maya at" in capsys.readouterr().err
 
 
+def test_exec_touches_last_call_after_a_failed_call(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The idle timer is silent during a call: a call longer than the TTL must not count as idle."""
+    import os
+
+    from maya_harness import transport
+
+    work = tmp_path / "work"
+    work.mkdir()
+    last_call = work / "last_call"
+
+    def execute(url: str, code: str, timeout: float) -> transport.Result:
+        last_call.touch()
+        os.utime(last_call, (0, 0))  # the call took longer than any TTL
+        raise ConnectionResetError("the call was cut")
+
+    monkeypatch.setattr(cli, "select", lambda url: ("http://127.0.0.1:1/mcp", None))
+    monkeypatch.setattr(transport, "connect", lambda url, timeout, expected=None: work)
+    monkeypatch.setattr(transport, "execute", execute)
+    assert cli.main(["exec", "-c", "1"]) == cli.FAILED  # the code reached Maya
+    assert last_call.stat().st_mtime > 1_000_000_000
+
+
 def test_exec_whose_maya_refuses_the_connection_runs_nothing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Maya died after connect: the request never reached it, so exit 2 is safe to retry."""
     import urllib.error
@@ -134,6 +156,11 @@ def test_stop_goes_on_past_a_maya_that_does_not_answer(monkeypatch: pytest.Monke
     monkeypatch.setattr(process, "process_alive", lambda pid: False)
     assert cli.main(["stop", "--all-mine"]) == cli.FAILED
     assert quit_sent == [other.state.url]
+
+
+def test_environment_passes_the_ttl() -> None:
+    env = session.environment({}, Path("C:/s"), session.SessionParams("p", Path("C:/p")), 1, ttl=5)
+    assert env["MAYA_HARNESS_TTL"] == "5"
 
 
 def test_exec_reload_is_a_call_of_its_own(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
