@@ -20,6 +20,10 @@
   `DCC_MCP_GATEWAY_PORT=0` keep this Maya out of the user's dcc-mcp gateway.
 * The Maya is marked by `MAYA_HARNESS_WORK`, its work directory: the harness runs code only in
   a Maya with the marker, and an artist's Maya has none.
+* `pylib/` holds a copy of this package and is the last on Maya's `PYTHONPATH`, after the
+  project's `sys_path`: the code of a scenario imports `maya_harness.inmaya`. A copy, not the
+  parent of the installed package: that is the `site-packages` of the project's `.venv`, with
+  pytest, mypy and the rest.
 * A Maya left running and forgotten lives on a hidden desktop, where nobody can close it by
   hand: `userSetup.py` starts a timer that quits Maya after `MAYA_HARNESS_TTL` idle minutes.
   Idle is the age of `work/last_call`, which `exec` touches before and after its call: the timer
@@ -276,8 +280,7 @@ def environment(base: Mapping[str, str], root: Path, params: SessionParams, port
         MAYA_HARNESS_TTL=str(ttl),
         **{MARKER: str(work), PROJECT_VARIABLE: params.project},
     )
-    if params.sys_path:
-        env["PYTHONPATH"] = os.pathsep.join(str(path) for path in params.sys_path)
+    env["PYTHONPATH"] = os.pathsep.join(str(path) for path in (*params.sys_path, root / "pylib"))
     if params.plug_in_path:
         env["MAYA_PLUG_IN_PATH"] = os.pathsep.join(str(path) for path in params.plug_in_path)
     return env
@@ -300,4 +303,6 @@ def prepare(
     shutil.copy(module, modules / module.name)  # its paths are absolute
     (root / "work").mkdir()
     (root / "appdata").mkdir()
+    package = Path(__file__).resolve().parent
+    shutil.copytree(package, root / "pylib" / package.name, ignore=shutil.ignore_patterns("__pycache__"))
     return environment(base, root, params, port, ttl)
