@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import tempfile
 import time
 from collections.abc import Callable, Mapping
@@ -117,6 +118,34 @@ def module_file(environ: Mapping[str, str], home: Path | None = None) -> Path:
     if environ.get(MODULE_VARIABLE):
         return Path(environ[MODULE_VARIABLE])
     return (home or Path.home()) / "Documents" / "maya" / "modules" / "dcc_mcp_maya.mod"
+
+
+@dataclass(frozen=True)
+class Module:
+    """What the first line of a `.mod` says: `+ MAYAVERSION:2025 PLATFORM:win64 <name> <version> <dir>`,
+    and the module-relative paths of the lines after it (`PYTHONPATH+:=python`)."""
+
+    name: str
+    version: str
+    directory: Path
+    paths: tuple[Path, ...]
+
+
+def read_module(path: Path) -> Module:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    fields = lines[0].split(None, 5) if lines else []
+    if len(fields) < 6 or fields[0] != "+":
+        raise ValueError(f"{path}: the first line is not `+ <conditions> <name> <version> <dir>`")
+    directory = Path(fields[5])
+    paths = tuple(directory / line.split(":=", 1)[1].strip() for line in lines[1:] if ":=" in line)
+    return Module(fields[3], fields[4], directory, paths)
+
+
+def free_port() -> int:
+    """A currently free localhost port; dcc-mcp binds it as soon as Maya starts."""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
 
 
 def read_state(root: Path) -> State | None:

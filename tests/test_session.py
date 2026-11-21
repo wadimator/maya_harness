@@ -179,3 +179,24 @@ def test_module_file() -> None:
     assert session.module_file({session.MODULE_VARIABLE: r"D:\x.mod"}) == Path(r"D:\x.mod")
     home = Path("C:/Users/u")
     assert session.module_file({}, home) == home / "Documents" / "maya" / "modules" / "dcc_mcp_maya.mod"
+
+
+def test_read_module(tmp_path: Path) -> None:
+    mod = tmp_path / "dcc_mcp_maya.mod"
+    mod.write_text(
+        "+ MAYAVERSION:2025 PLATFORM:win64 dcc_mcp_maya 0.9.43 C:/My Modules/dcc-mcp\n"
+        "PYTHONPATH+:=python\nPLUG_IN_PATH+:=plug-ins\n",
+        encoding="utf-8",
+    )
+    module = session.read_module(mod)
+    assert module.name == "dcc_mcp_maya"
+    assert module.version == "0.9.43"
+    assert module.directory == Path("C:/My Modules/dcc-mcp")
+    assert module.paths == (Path("C:/My Modules/dcc-mcp/python"), Path("C:/My Modules/dcc-mcp/plug-ins"))
+
+
+def test_read_module_refuses_a_broken_first_line(tmp_path: Path) -> None:
+    mod = tmp_path / "x.mod"
+    mod.write_text("PYTHONPATH+:=python\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="first line"):
+        session.read_module(mod)

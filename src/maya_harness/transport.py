@@ -5,6 +5,8 @@
 * The handshake is `initialize`, then `notifications/initialized`. Code runs as a `tools/call`
   of `execute_python` on Maya's main thread; the reply's `structuredContent` holds `success`,
   `error`, and `context` with `stdout`, `stderr` and the `output` of the last expression as JSON.
+  The value is asked for only when the code ends in an expression: dcc-mcp-maya 0.9.43 runs code
+  without one and then fails the call.
 * A call that comes while Maya opens, saves or clears a scene is refused with the error code
   `maya-busy` (the DCC_MCP patch of the module: run nested in `file -open`, it would see a half
   loaded scene). `execute` repeats such a call every `BUSY_RETRY` seconds until its timeout.
@@ -17,10 +19,13 @@
 
 from __future__ import annotations
 
+import ast
+import http.client
 import json
 import os
 import threading
 import time
+import urllib.error
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -38,17 +43,35 @@ class TransportError(RuntimeError):
     """The call did not reach Maya, or Maya is not a session of maya_harness."""
 
 
+class ReplyError(OSError):
+    """The server got the request, but its reply cannot be read: cut short, or not dcc-mcp's. The
+    code may have run."""
+
+
 @dataclass(frozen=True)
 class Result:
-    """What a call of `execute` returned. `output` is the last expression's value, decoded from
-    JSON; `error` is the server's error, or the traceback of the code."""
+    """What a call of `execute` returned. `output` is the last expression's value as text: a
+    string as it is, anything else as its `str()` (`{'a': 1}`, not JSON), so code that wants JSON
+    ends in `json.dumps(...)`. `error` is the server's error code: for code that raised,
+    dcc-mcp-maya 0.9.43 names it `RuntimeError` whatever was raised, and the real type ends the
+    traceback in `stderr`. A refusal without a traceback has its reason in `error` (a blocked
+    `cmds.file`, no code) or, when the server gives it only in `_meta`, in `stderr`."""
 
     success: bool
     error: str = ""
     stdout: str = ""
     stderr: str = ""
-    output: Any = None
+    output: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
+
+    def value(self) -> Any:
+        """`output` decoded; None when there is none, the text itself when it is not JSON."""
+        if not self.output:
+            return None
+        try:
+            return json.loads(self.output)
+        except ValueError:
+            return self.output
 
 
 def server_logs(pid: int) -> list[Path]:
@@ -115,15 +138,33 @@ def call(url: str, method: str, params: dict[str, object], request_id: int | Non
         data=json.dumps(message).encode("utf-8"),
         headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
     )
-    body = read_in_background(request, timeout)
-    if request_id is None or not body:
-        return {}
-    reply: dict[str, Any] = json.loads(body)
+    try:
+        body = read_in_background(request, timeout)
+        reply = json.loads(body) if request_id is not None and body else {}
+    except (urllib.error.HTTPError, ConnectionError):  # Maya answered or hung up: the code may have run
+        raise
+    except urllib.error.URLError as error:  # urllib raises it only while connecting or sending
+        raise TransportError(f"no connection to {url}: {error.reason}") from error
+    except (http.client.HTTPException, ValueError) as error:  # a cut reply, not UTF-8, not JSON
+        raise ReplyError(f"unreadable reply from {url}: {error}") from error
+    if not isinstance(reply, dict):
+        raise ReplyError(f"unreadable reply from {url}: not a JSON object")
     return reply
 
 
+def result_type(code: str) -> str:
+    """`JSON` when the code ends in an expression, else `NONE`: dcc-mcp fails a value request for
+    code without one after running it. Code that does not parse goes as `JSON`, and Maya reports
+    its error."""
+    try:
+        body = ast.parse(code).body
+    except (SyntaxError, ValueError):
+        return "JSON"
+    return "JSON" if body and isinstance(body[-1], ast.Expr) else "NONE"
+
+
 def _execute_once(url: str, code: str, timeout: float) -> dict[str, Any]:
-    arguments = {"code": code, "result_type": "JSON", "capture_output": True}
+    arguments = {"code": code, "result_type": result_type(code), "capture_output": True}
     reply = call(url, "tools/call", {"name": "execute_python", "arguments": arguments}, 2, timeout)
     if "error" in reply:  # the server refused the call itself, e.g. an unknown tool
         return {"success": False, "error": json.dumps(reply["error"], ensure_ascii=False)}
@@ -138,17 +179,13 @@ def is_busy(content: dict[str, Any]) -> bool:
 def to_result(content: dict[str, Any]) -> Result:
     context = content.get("context") or {}
     output = context.get("output")
-    try:
-        value = json.loads(output) if isinstance(output, str) and output else None
-    except ValueError:
-        value = output
     error = content.get("error") or ""
     return Result(
         success=bool(content.get("success")),
         error=error if isinstance(error, str) else json.dumps(error, ensure_ascii=False),
         stdout=str(context.get("stdout") or ""),
-        stderr=str(context.get("stderr") or ""),
-        output=value,
+        stderr=str(context.get("stderr") or ((content.get("_meta") or {}).get("dcc.error") or {}).get("message") or ""),
+        output="" if output is None else output if isinstance(output, str) else json.dumps(output, ensure_ascii=False),
         raw=content,
     )
 
@@ -159,12 +196,12 @@ def execute(url: str, code: str, timeout: float) -> Result:
     while True:
         left = deadline - time.monotonic()
         if left <= 0:
-            raise TimeoutError(f"no time left for a call to {url}")
+            raise TransportError(f"no time left for a call to {url}")
         content = _execute_once(url, code, left)
         if not is_busy(content):
             return to_result(content)
         if deadline - time.monotonic() <= BUSY_RETRY:
-            raise TimeoutError(f"Maya at {url} stayed {BUSY} (opening or saving a scene) for {timeout:.0f} s")
+            raise TransportError(f"Maya at {url} stayed {BUSY} (opening or saving a scene) for {timeout:.0f} s")
         time.sleep(BUSY_RETRY)
 
 
@@ -183,7 +220,8 @@ def connect(url: str, timeout: float, work: Path | None = None) -> None:
     result = execute(url, MARKER_CODE, timeout)
     if not result.success:
         raise TransportError(f"{url} did not check its marker: {result.error or result.raw}")
-    if not result.output:
+    marker = result.value()
+    if not marker:
         raise TransportError(f"{url} is not a Maya started by maya_harness: nothing is run there.")
-    if work is not None and result.output != str(work):
-        raise TransportError(f"{url} is another Maya of maya_harness: its marker is {result.output}, not {work}.")
+    if work is not None and marker != str(work):
+        raise TransportError(f"{url} is another Maya of maya_harness: its marker is {marker}, not {work}.")

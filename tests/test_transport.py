@@ -1,4 +1,8 @@
+import http.client
 import json
+import urllib.error
+import urllib.request
+from email.message import Message
 from typing import Any
 
 import pytest
@@ -38,13 +42,13 @@ def test_busy_is_repeated_until_maya_answers(monkeypatch: pytest.MonkeyPatch) ->
     server = FakeServer(monkeypatch, BUSY, BUSY, ok())
     result = transport.execute(URL, "1", timeout=10)
     assert result.success
-    assert result.output == "done"
+    assert result.value() == "done"
     assert server.calls == 3
 
 
 def test_busy_until_timeout_is_an_error_about_maya_busy(monkeypatch: pytest.MonkeyPatch) -> None:
     server = FakeServer(monkeypatch, BUSY)
-    with pytest.raises(TimeoutError, match="maya-busy"):
+    with pytest.raises(transport.TransportError, match="maya-busy"):
         transport.execute(URL, "1", timeout=3)
     assert server.calls > 1
 
@@ -67,7 +71,7 @@ def test_failed_code_mentioning_maya_busy_is_not_repeated(monkeypatch: pytest.Mo
 
 def test_no_time_left_is_an_error_without_a_call(monkeypatch: pytest.MonkeyPatch) -> None:
     server = FakeServer(monkeypatch, ok())
-    with pytest.raises(TimeoutError):
+    with pytest.raises(transport.TransportError):
         transport.execute(URL, "1", timeout=0)
     assert server.calls == 0
 
@@ -89,3 +93,99 @@ def test_connect_refuses_another_session(monkeypatch: pytest.MonkeyPatch) -> Non
     FakeServer(monkeypatch, ok(output="C:/other/work"))
     with pytest.raises(transport.TransportError, match="another Maya"):
         transport.connect(URL, timeout=10, work=transport.Path("C:/mine/work"))
+
+
+def test_a_refused_connection_did_not_reach_maya(monkeypatch: pytest.MonkeyPatch) -> None:
+    """urllib wraps in URLError only what fails while connecting or sending: Maya got no request."""
+
+    def refused(request: urllib.request.Request, timeout: float) -> str:
+        raise urllib.error.URLError(ConnectionRefusedError(10061, "refused"))
+
+    monkeypatch.setattr(transport, "read_in_background", refused)
+    with pytest.raises(transport.TransportError, match="no connection"):
+        transport.execute(URL, "1", timeout=10)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ConnectionResetError(10054, "reset"),
+        http.client.RemoteDisconnected("closed"),
+        urllib.error.HTTPError(URL, 500, "error", Message(), None),
+    ],
+)
+def test_a_reset_or_an_http_error_is_not_a_transport_error(monkeypatch: pytest.MonkeyPatch, error: OSError) -> None:
+    """Maya got the request: the code may have run, and exec must not say that nothing was run."""
+
+    def fail(request: urllib.request.Request, timeout: float) -> str:
+        raise error
+
+    monkeypatch.setattr(transport, "read_in_background", fail)
+    with pytest.raises(type(error)):
+        transport.execute(URL, "1", timeout=10)
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "<html>not dcc-mcp</html>",
+        "[1]",
+        http.client.IncompleteRead(b"{", 99),
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+    ],
+)
+def test_an_unreadable_reply_is_a_reply_error(monkeypatch: pytest.MonkeyPatch, reply: str | Exception) -> None:
+    """Not a ValueError out of `main`: an OSError, so exec says the code may have run."""
+
+    def read(request: urllib.request.Request, timeout: float) -> str:
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    monkeypatch.setattr(transport, "read_in_background", read)
+    with pytest.raises(transport.ReplyError, match="unreadable reply"):
+        transport.execute(URL, "1", timeout=10)
+
+
+@pytest.mark.parametrize(
+    ("code", "result_type"),
+    [
+        ("x = 1", "NONE"),
+        ("for i in range(2):\n    i", "NONE"),
+        ("# only a comment", "NONE"),
+        ("import os\nos.sep", "JSON"),
+        ("1", "JSON"),
+        ("def f(:", "JSON"),
+    ],
+)
+def test_a_value_is_asked_only_of_code_ending_in_an_expression(
+    monkeypatch: pytest.MonkeyPatch, code: str, result_type: str
+) -> None:
+    """dcc-mcp fails a value request for code that does not end in an expression."""
+    sent: list[object] = []
+
+    def call(url: str, method: str, params: dict[str, Any], request_id: int | None, timeout: float) -> Any:
+        sent.append(params["arguments"]["result_type"])
+        return {"result": {"structuredContent": ok()}}
+
+    monkeypatch.setattr(transport, "call", call)
+    assert transport.execute(URL, code, timeout=10).success
+    assert sent == [result_type]
+
+
+def test_a_failure_without_stderr_keeps_the_explanation_of_the_server() -> None:
+    """The reply of dcc-mcp-maya 0.9.43: the explanation is only in `_meta`."""
+    explanation = "result_type='JSON' requested but the source does not end with a standalone expression."
+    content = {
+        "success": False,
+        "message": "Python execution failed",
+        "error": "RuntimeError",
+        "context": {
+            "stdout": "",
+            "stderr": "",
+            "error_type": "RuntimeError",
+            "traceback": f"RuntimeError: {explanation}\n",
+        },
+        "_meta": {"dcc.error": {"type": "RuntimeError", "message": explanation}},
+    }
+    assert transport.to_result(content).stderr == explanation
