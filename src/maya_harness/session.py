@@ -211,6 +211,11 @@ def read_state(root: Path) -> State | None:
     return state
 
 
+def touch(work: Path) -> None:
+    """Marks a call: the idle timer of the session counts from the mtime of `last_call`."""
+    (work / "last_call").touch()
+
+
 def write_state(root: Path, state: State) -> None:
     (root / STATE_FILE).write_text(json.dumps(asdict(state), ensure_ascii=False, indent=2), encoding="utf-8")
 
