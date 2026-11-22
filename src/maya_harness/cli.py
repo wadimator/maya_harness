@@ -116,17 +116,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 130
 
 
-def maya_and_module() -> tuple[Path, Path]:
-    """`maya.exe` and the dcc-mcp `.mod` a new session needs."""
-    maya_exe = session.maya_exe(os.environ)
-    if not maya_exe.is_file():
-        raise NotRun(f"no Maya at {maya_exe}; set MAYAPY_EXE or MAYA_LOCATION")
-    module = session.module_file(os.environ)
-    if not module.is_file():
-        raise NotRun(f"no dcc-mcp-maya module at {module}; set {session.MODULE_VARIABLE} to its .mod file")
-    return maya_exe, module
-
-
 def start(args: argparse.Namespace) -> int:
     project = config.load(Path.cwd())
     if args.ttl < 0:
@@ -215,19 +204,8 @@ def run_scenarios(args: argparse.Namespace) -> int:
         work = transport.connect(args.url, CALL_TIMEOUT)
         outcomes = scenario_run.run_at_url(args.url, work, runs, codes, out)
     else:
-        maya_exe, module = maya_and_module()
         count = 1 if args.visible else max(1, min(args.jobs, len(runs)))
-        pool = scenario_run.run_in_pool(
-            project,
-            runs,
-            codes,
-            count,
-            args.visible,
-            lambda env, visible, number: process.MayaProcess(maya_exe, env, visible, number),
-            module,
-            temp_dir(),
-            out,
-        )
+        pool = scenario_run.run_in_pool(project, runs, codes, count, args.visible, temp_dir(), out)
         if not pool.ready:
             raise NotRun("no Maya started; see the errors above")
         outcomes = pool.outcomes

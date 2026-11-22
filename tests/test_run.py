@@ -173,16 +173,56 @@ def test_run_without_scenario_settings_runs_nothing(
     assert "no [tool.maya_harness.scenarios]" in capsys.readouterr().err
 
 
+@pytest.fixture
+def installed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A `maya.exe` and a dcc-mcp `.mod` for `session.start` to find."""
+    (tmp_path / "maya.exe").touch()
+    (tmp_path / "x.mod").write_text("+ MAYAVERSION:2025 PLATFORM:win64 dcc_mcp_maya 1 C:/m\n", encoding="utf-8")
+    monkeypatch.setenv("MAYAPY_EXE", str(tmp_path / "mayapy.exe"))
+    monkeypatch.setenv(session.MODULE_VARIABLE, str(tmp_path / "x.mod"))
+
+
 def test_run_removes_the_session_of_a_maya_that_failed_to_start(
-    monkeypatch: pytest.MonkeyPatch, project: Path, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, project: Path, tmp_path: Path, installed: None
 ) -> None:
     def fail_to_start(*_: object, **__: object) -> None:
         raise OSError("no maya.exe")
 
-    monkeypatch.setattr(cli, "maya_and_module", lambda: (tmp_path / "maya.exe", tmp_path / "x.mod"))
-    monkeypatch.setattr(session, "prepare", lambda *_, **__: {})
-    monkeypatch.setattr(cli.process, "MayaProcess", fail_to_start)
+    monkeypatch.setattr(session.process, "MayaProcess", fail_to_start)
     assert cli.main(["run", "check_fps"]) == cli.NOT_RUN
+    assert list((tmp_path / "temp").iterdir()) == []
+
+
+def test_the_pool_starts_every_maya_before_it_waits_for_any(
+    monkeypatch: pytest.MonkeyPatch, project: Path, tmp_path: Path, installed: None
+) -> None:
+    events: list[str] = []
+    desktops: set[int] = set()
+
+    class Maya:
+        def __init__(self, exe: Path, env: dict[str, str], visible: bool, number: int) -> None:
+            self.pid = number
+            events.append("start")
+            desktops.add(number)
+
+        def running(self) -> bool:
+            return False
+
+        def close(self) -> None: ...
+
+        def window_titles(self) -> list[str]:
+            return []
+
+    def wait_for_server(*_: object) -> None:
+        events.append("wait")
+        raise TimeoutError("no server")
+
+    monkeypatch.setattr(session.process, "MayaProcess", Maya)
+    monkeypatch.setattr(session.transport, "wait_for_server", wait_for_server)
+    monkeypatch.setattr(session.transport, "server_logs", lambda pid: [])  # the fake pids are not its Mayas
+    assert cli.main(["run", "all", "--jobs", "3"]) == cli.NOT_RUN
+    assert events == ["start", "start", "start", "wait", "wait", "wait"]
+    assert len(desktops) == 3
     assert list((tmp_path / "temp").iterdir()) == []
 
 
