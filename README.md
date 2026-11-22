@@ -88,6 +88,39 @@ runs = "dev_tools/maya_checks/runs.toml"  # таблица прогонов: ч�
 Значение последнего выражения печатается как `str()`: словарь — `{'a': 1}`, не JSON. Нужен
 JSON — заканчивай код `json.dumps(...)`.
 
+## API для библиотеки
+
+Свой раннер поверх пакета берёт сеанс из `maya_harness.session`, а не собирает его из
+`process` и `transport`:
+
+```python
+from pathlib import Path
+
+from maya_harness import session
+
+params = session.SessionParams("probe", Path.cwd(), sys_path=(Path.cwd() / "src",))
+with session.start(params, visible=False, env=None) as s:
+    s.wait(180)
+    result = s.execute("import maya.cmds as c; c.about(v=True)", 60)
+    print(result.success, result.value())
+```
+
+* `start` заводит каталог сеанса и поднимает Maya, но сервер не ждёт: так пул поднимает
+  несколько Maya сразу. До `execute` обязателен `wait(timeout)`.
+* Нет `maya.exe`, нет `.mod`, Maya не поднялась за `timeout` — `session.StartError`; в тексте
+  pid, окна Maya и её логи.
+* При выходе из `with`, исключении и Ctrl+C Maya убита (job object), каталог сеанса удалён.
+  Когда сеансов несколько или сеанс меняется в цикле — без `with`: `start`, `wait`, а
+  `close()` — в `finally`.
+* `release()` — только чтобы Maya пережила процесс (так делает `maya-harness start`): ни Maya,
+  ни каталог тогда не удаляются.
+* `env` — базовое окружение, по умолчанию `os.environ`: по нему ищутся `maya.exe` и `.mod`, из
+  него строится окружение Maya. `MAYA_*`, `PYTHONPATH`, `PYTHONHOME`, `PYTHONSTARTUP` и
+  `VIRTUAL_ENV` пакет убирает из него всё равно.
+* `execute(code, timeout)` возвращает `Result`: `success`, `error`, `stdout`, `stderr`,
+  `output` — значение последнего выражения текстом; `value()` — оно же, разобранное как JSON
+  (не JSON — текст как есть, нет значения — `None`).
+
 ## Примеры для агента
 
 ```powershell

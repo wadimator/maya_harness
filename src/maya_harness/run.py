@@ -27,20 +27,17 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
-import os
 import queue
-import shutil
 import sys
 import threading
 import time
 import tomllib
-from collections.abc import Callable
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple, TextIO
 
-from . import config, process, session, transport
+from . import config, session, transport
 
 PREFIX = "check_"  # a scenario's module name; the modules with it are dropped before each run
 JOBS = 3
@@ -242,26 +239,13 @@ def run_at_url(url: str, work: Path, runs: list[Run], codes: list[str], out: Tex
     return outcomes
 
 
-@dataclass
-class Slot:
-    """One Maya of the pool and its session directory."""
-
-    root: Path
-    maya: process.MayaProcess
-    url: str
-
-    @property
-    def work(self) -> Path:
-        return self.root / "work"
-
-
 class Pool:
     """Mayas of this run, each driven by a worker thread that takes runs from one queue in their order.
 
     A Maya that crashes or times out fails its run and leaves; the others take the rest of the queue. A stop
     (Ctrl+C) lets no worker take another run."""
 
-    def __init__(self, runs: list[Run], codes: list[str], slots: list[Slot], out: TextIO) -> None:
+    def __init__(self, runs: list[Run], codes: list[str], slots: list[session.Session], out: TextIO) -> None:
         self.runs = runs
         self.codes = codes
         self.slots = slots
@@ -299,12 +283,11 @@ class Pool:
         maya = slot.maya
         name = f"maya{number + 1}"
         try:
-            transport.wait_for_server(slot.url, slot.work, maya.running, transport.STARTUP_TIMEOUT)
-            transport.connect(slot.url, transport.STARTUP_TIMEOUT, slot.work)
-        except (transport.TransportError, TimeoutError, OSError) as error:
+            slot.wait(transport.STARTUP_TIMEOUT)
+        except session.StartError as error:
             if not self.stop.is_set():
                 with self.lock:
-                    print(f"{name}: Maya {maya.pid} did not start: {error}", file=sys.stderr, flush=True)
+                    print(f"{name}: {error}", file=sys.stderr, flush=True)
             maya.close()
             return
         self.ready.add(number)
@@ -351,34 +334,20 @@ def run_in_pool(
     codes: list[str],
     count: int,
     visible: bool,
-    start_maya: Callable[[dict[str, str], bool, int], process.MayaProcess],
-    module: Path,
     temp: Path,
     out: TextIO,
 ) -> Pool:
-    """Starts `count` Mayas, runs `runs` in them and closes them. `start_maya(env, visible, number)`
-    starts one."""
-    roots: list[Path] = []
-    slots: list[Slot] = []
+    """Starts `count` Mayas, runs `runs` in them and closes them."""
+    slots: list[session.Session] = []
     pool = Pool(runs, codes, slots, out)
-    try:
-        for number in range(1, count + 1):
-            roots.append(session.make_session_dir(project.project, temp))
-            port = session.free_port()
-            env = session.prepare(roots[-1], project.params(), module, os.environ, port)
-            maya = start_maya(env, visible, number)
-            for log in transport.server_logs(maya.pid):  # Windows reuses pids: a stale log holds a stale address
-                log.unlink(missing_ok=True)
-            slots.append(Slot(roots[-1], maya, f"http://127.0.0.1:{port}/mcp"))
+    with contextlib.ExitStack() as stack:  # every Maya starts before any is waited for
+        for _ in range(count):
+            started = session.start(project.params(), visible=visible, temp=temp)
+            slots.append(stack.enter_context(started))
         pool.run()
-    finally:
-        for slot in slots:  # separate loops: a directory whose Maya failed to start has no Maya
-            slot.maya.close()
-        for root in roots:
-            shutil.rmtree(root, ignore_errors=True)
     failed = {outcome.maya for outcome in pool.outcomes.values() if not outcome.ok}
     for number, slot in enumerate(slots, start=1):  # the log of a Maya whose run failed stays
         if number not in failed and number - 1 in pool.ready:
-            for log in transport.server_logs(slot.maya.pid):
+            for log in transport.server_logs(slot.pid):
                 log.unlink(missing_ok=True)
     return pool

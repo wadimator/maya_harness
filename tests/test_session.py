@@ -232,3 +232,120 @@ def test_read_module_refuses_a_broken_first_line(tmp_path: Path) -> None:
     mod.write_text("PYTHONPATH+:=python\n", encoding="utf-8")
     with pytest.raises(ValueError, match="first line"):
         session.read_module(mod)
+
+
+class FakeMaya:
+    """`process.MayaProcess` without a Maya."""
+
+    def __init__(self, exe: Path, env: dict[str, str], visible: bool = False, number: int = 1) -> None:
+        self.pid = 4242
+        self.created = 7
+        self.closed = False
+        self.released = False
+
+    def running(self) -> bool:
+        return not self.closed
+
+    def close(self) -> None:
+        self.closed = True
+
+    def release(self) -> None:
+        self.released = True
+
+    def window_titles(self) -> list[str]:
+        return ["Autodesk Maya 2025"]
+
+
+@pytest.fixture
+def installed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """A `maya.exe` and a dcc-mcp `.mod` in `tmp_path`, a fake MayaProcess; returns the temp to start in."""
+    (tmp_path / "maya.exe").touch()
+    (tmp_path / "mayapy.exe").touch()
+    (tmp_path / "dcc_mcp_maya.mod").write_text("+ MAYAVERSION:2025 PLATFORM:win64 dcc_mcp_maya 1 C:/m\n", "utf-8")
+    monkeypatch.setenv("MAYAPY_EXE", str(tmp_path / "mayapy.exe"))
+    monkeypatch.setenv(session.MODULE_VARIABLE, str(tmp_path / "dcc_mcp_maya.mod"))
+    monkeypatch.setattr(session.process, "MayaProcess", FakeMaya)
+    monkeypatch.setattr(session.transport, "server_logs", lambda pid: [])
+    temp = tmp_path / "temp"
+    temp.mkdir()
+    return temp
+
+
+STARTED = SessionParams(PROJECT, Path("C:/project"))
+
+
+def session_dirs(temp: Path) -> list[Path]:
+    return list(temp.glob(f"{session.PREFIX}*"))
+
+
+@pytest.mark.parametrize("missing", ["maya.exe", "dcc_mcp_maya.mod"])
+def test_start_without_maya_or_module_refuses(installed: Path, missing: str) -> None:
+    (installed.parent / missing).unlink()
+    with pytest.raises(session.StartError, match="no Maya at" if missing == "maya.exe" else "no dcc-mcp-maya"):
+        session.start(STARTED, temp=installed)
+    assert session_dirs(installed) == []
+
+
+def test_start_interrupted_in_maya_start_leaves_no_directory(installed: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def interrupted(*args: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(session.process, "MayaProcess", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        session.start(STARTED, temp=installed)
+    assert session_dirs(installed) == []
+
+
+@pytest.mark.parametrize("raised", [RuntimeError, KeyboardInterrupt])
+def test_with_closes_the_maya_and_removes_the_directory(
+    installed: Path, monkeypatch: pytest.MonkeyPatch, raised: type[BaseException]
+) -> None:
+    def wait_for_server(*args: object) -> None:
+        if raised is KeyboardInterrupt:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(session.transport, "wait_for_server", wait_for_server)
+    monkeypatch.setattr(session.transport, "connect", lambda url, timeout, work: work)
+    with pytest.raises(raised), session.start(STARTED, temp=installed) as started:
+        started.wait(1)
+        raise raised
+    assert isinstance(started.maya, FakeMaya) and started.maya.closed
+    assert session_dirs(installed) == []
+
+
+def test_wait_turns_a_timeout_into_start_error(installed: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def wait_for_server(*args: object) -> None:
+        raise TimeoutError("no server")
+
+    monkeypatch.setattr(session.transport, "wait_for_server", wait_for_server)
+    with session.start(STARTED, temp=installed) as started, pytest.raises(session.StartError, match="Maya 4242"):
+        started.wait(1)
+
+
+def test_release_keeps_the_maya_and_the_directory(installed: Path) -> None:
+    with session.start(STARTED, temp=installed) as started:
+        started.release()
+    assert isinstance(started.maya, FakeMaya) and started.maya.released and not started.maya.closed
+    assert session_dirs(installed) == [started.root]
+
+
+@pytest.mark.parametrize("record", [True, False])
+def test_record_writes_state(installed: Path, record: bool) -> None:
+    with session.start(STARTED, temp=installed, ttl=5, record=record) as started:
+        state = session.read_state(started.root)
+        if record:
+            assert state is not None
+            expected = State(PROJECT, str(STARTED.project_root), os.getpid(), 4242, started.url, state.started, 5, 7)
+            assert state == expected
+        else:
+            assert not (started.root / session.STATE_FILE).exists()
+
+
+def test_execute_touches_last_call(installed: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(session.transport, "execute", lambda url, code, timeout: session.transport.Result(True))
+    with session.start(STARTED, temp=installed) as started:
+        last_call = started.work / "last_call"
+        last_call.touch()
+        os.utime(last_call, (NOW, NOW))
+        assert started.execute("1", 1).success
+        assert last_call.stat().st_mtime > NOW

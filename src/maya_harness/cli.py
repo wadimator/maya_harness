@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -22,7 +21,7 @@ from typing import Any
 
 from . import config, process, session, transport
 from . import run as scenario_run
-from .session import Session, State
+from .session import Record
 
 CALL_TIMEOUT = 900  # seconds per `exec`
 QUIT_TIMEOUT = 60  # seconds for a quitting Maya to exit
@@ -100,6 +99,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return commands[args.command](args)
     except (
         NotRun,
+        session.StartError,
         config.ConfigError,
         scenario_run.Refused,
         transport.TransportError,
@@ -116,64 +116,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 130
 
 
-def maya_and_module() -> tuple[Path, Path]:
-    """`maya.exe` and the dcc-mcp `.mod` a new session needs."""
-    maya_exe = session.maya_exe(os.environ)
-    if not maya_exe.is_file():
-        raise NotRun(f"no Maya at {maya_exe}; set MAYAPY_EXE or MAYA_LOCATION")
-    module = session.module_file(os.environ)
-    if not module.is_file():
-        raise NotRun(f"no dcc-mcp-maya module at {module}; set {session.MODULE_VARIABLE} to its .mod file")
-    return maya_exe, module
-
-
 def start(args: argparse.Namespace) -> int:
     project = config.load(Path.cwd())
-    maya_exe, module = maya_and_module()
     if args.ttl < 0:
         raise NotRun("--ttl takes 0 or more minutes")
-
-    root = session.make_session_dir(project.project, temp_dir())
-    port = session.free_port()
-    url = f"http://127.0.0.1:{port}/mcp"
-    work = root / "work"
-    maya: process.MayaProcess | None = None
-    kept = False
-    try:
-        env = session.prepare(root, project.params(), module, os.environ, port, args.ttl)
-        maya = process.MayaProcess(maya_exe, env, args.visible)
-        for log in transport.server_logs(maya.pid):
-            log.unlink(missing_ok=True)
-        state = State(
-            project.project, str(project.root), os.getpid(), maya.pid, url, time.time(), args.ttl, maya.created
-        )
-        session.write_state(root, state)
-        try:
-            transport.wait_for_server(url, work, maya.running, transport.STARTUP_TIMEOUT)
-            transport.connect(url, transport.STARTUP_TIMEOUT, work)
-        except (transport.TransportError, TimeoutError, OSError) as error:
-            titles = maya.window_titles() if maya.running() else []
-            logs = [str(log) for log in transport.server_logs(maya.pid)]
-            raise NotRun(f"Maya {maya.pid} did not start: {error}; its windows {titles}; its logs {logs}") from error
-        maya.release()
-        kept = True
-        pid = maya.pid
-    finally:
-        if not kept:
-            if maya is not None:
-                maya.close()
-            shutil.rmtree(root, ignore_errors=True)
-    print(f"Maya {pid} of {project.project} is running at {url}")
+    params = project.params()
+    with session.start(params, visible=args.visible, ttl=args.ttl, record=True, temp=temp_dir()) as running:
+        running.wait(transport.STARTUP_TIMEOUT)
+        running.release()
+    print(f"Maya {running.pid} of {project.project} is running at {running.url}")
     return OK
 
 
-def find_project_sessions(found: list[Session], root: Path) -> list[Session]:
+def find_project_sessions(found: list[Record], root: Path) -> list[Record]:
     """The sessions started from the project at `root`, the latest last. By the project root, not
     the project name: a worktree has the same name, and its Maya has the other tree on sys.path."""
     return [item for item in found if Path(item.state.project_root) == root]
 
 
-def select(url: str | None) -> tuple[str, Session | None]:
+def select(url: str | None) -> tuple[str, Record | None]:
     """The address to call: `url`, or the latest live session of the project here."""
     found = session.sessions(temp_dir())
     if url:
@@ -243,19 +204,8 @@ def run_scenarios(args: argparse.Namespace) -> int:
         work = transport.connect(args.url, CALL_TIMEOUT)
         outcomes = scenario_run.run_at_url(args.url, work, runs, codes, out)
     else:
-        maya_exe, module = maya_and_module()
         count = 1 if args.visible else max(1, min(args.jobs, len(runs)))
-        pool = scenario_run.run_in_pool(
-            project,
-            runs,
-            codes,
-            count,
-            args.visible,
-            lambda env, visible, number: process.MayaProcess(maya_exe, env, visible, number),
-            module,
-            temp_dir(),
-            out,
-        )
+        pool = scenario_run.run_in_pool(project, runs, codes, count, args.visible, temp_dir(), out)
         if not pool.ready:
             raise NotRun("no Maya started; see the errors above")
         outcomes = pool.outcomes
@@ -300,7 +250,7 @@ def stop(args: argparse.Namespace) -> int:
     return FAILED if running else OK
 
 
-def describe(item: Session, now: float) -> dict[str, Any]:
+def describe(item: Record, now: float) -> dict[str, Any]:
     last_call = item.work / "last_call"
     try:
         idle_since = last_call.stat().st_mtime

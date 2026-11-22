@@ -1,6 +1,6 @@
 [project]
 name = "maya-harness"
-version = "0.2.0"
+version = "0.3.0"
 description = "An isolated GUI Maya for plugin development: start, run code, look, stop"
 readme = "README.md"
 license = "Apache-2.0"

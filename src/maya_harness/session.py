@@ -34,10 +34,15 @@
   UserSetup Checksum verification», since `userSetup.py` is new in every session. A
   `userPrefs.mel` written in advance does not do it: Maya's first start in a new settings
   directory ignores it and writes its own.
+* As a library: `start` makes the directory and starts Maya, `Session.wait` waits for its
+  server. `start` does not wait, so a pool starts all its Mayas at once and waits for each in a
+  worker of its own. `Session.close` kills Maya and removes the directory; `Session.release`
+  leaves both, for a Maya that outlives this process (`maya-harness start`).
 """
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import shutil
@@ -48,9 +53,11 @@ from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from . import process, transport
 from .process import maya_alive, process_alive
 
 PREFIX = "maya_harness_"
+NUMBERS = itertools.count(1)  # of the Mayas `start` starts: each gets a desktop of its own
 STATE_FILE = "state.json"
 MARKER = "MAYA_HARNESS_WORK"
 PROJECT_VARIABLE = "MAYA_HARNESS_PROJECT"
@@ -135,13 +142,76 @@ class State:
 
 
 @dataclass(frozen=True)
-class Session:
+class Record:
+    """A session found on disk: its directory and its state.json."""
+
     root: Path
     state: State
 
     @property
     def work(self) -> Path:
         return self.root / "work"
+
+
+class StartError(Exception):
+    """No Maya to run code in: no maya.exe, no dcc-mcp module, or the Maya did not start."""
+
+
+@dataclass
+class Session:
+    """A Maya this process started and its session directory; `start` makes one."""
+
+    root: Path
+    maya: process.MayaProcess
+    url: str
+    released: bool = False
+
+    @property
+    def work(self) -> Path:
+        return self.root / "work"
+
+    @property
+    def pid(self) -> int:
+        """The pid of the Maya, after `close` too: its server logs are named by it."""
+        return self.maya.pid
+
+    def wait(self, timeout: float) -> None:
+        """Waits for the dcc-mcp server of the Maya and connects to it; StartError when it does not come."""
+        try:
+            transport.wait_for_server(self.url, self.work, self.maya.running, timeout)
+            transport.connect(self.url, timeout, self.work)
+        except (transport.TransportError, TimeoutError, OSError) as error:
+            titles = self.maya.window_titles() if self.maya.running() else []
+            logs = [str(log) for log in transport.server_logs(self.pid)]
+            raise StartError(
+                f"Maya {self.pid} did not start: {error}; its windows {titles}; its logs {logs}"
+            ) from error
+
+    def execute(self, code: str, timeout: float) -> transport.Result:
+        """Runs `code` in the Maya; marks the call before and after it for the idle timer."""
+        touch(self.work)
+        try:
+            return transport.execute(self.url, code, timeout)
+        finally:
+            touch(self.work)
+
+    def close(self) -> None:
+        """Kills the Maya and removes the directory; after `release`, does nothing."""
+        if self.released:
+            return
+        self.maya.close()
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def release(self) -> None:
+        """Lets the Maya and the directory outlive this process."""
+        self.maya.release()
+        self.released = True
+
+    def __enter__(self) -> Session:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
 
 def maya_exe(environ: Mapping[str, str]) -> Path:
@@ -246,13 +316,13 @@ def remove_stale(
     return removed
 
 
-def sessions(temp: Path, maya: Callable[[int, int], bool] = maya_alive) -> list[Session]:
+def sessions(temp: Path, maya: Callable[[int, int], bool] = maya_alive) -> list[Record]:
     """The sessions whose Maya is alive, the latest started last."""
     found = []
     for root in temp.glob(f"{PREFIX}*"):
         state = read_state(root) if root.is_dir() else None
         if state is not None and maya(state.maya_pid, state.maya_created):
-            found.append(Session(root, state))
+            found.append(Record(root, state))
     return sorted(found, key=lambda session: session.state.started)
 
 
@@ -311,3 +381,55 @@ def prepare(
     package = Path(__file__).resolve().parent
     shutil.copytree(package, root / "pylib" / package.name, ignore=shutil.ignore_patterns("__pycache__"))
     return environment(base, root, params, port, ttl)
+
+
+def start(
+    params: SessionParams,
+    *,
+    visible: bool = False,
+    env: Mapping[str, str] | None = None,
+    ttl: int = 0,
+    record: bool = False,
+    temp: Path | None = None,
+) -> Session:
+    """Starts a Maya of `params` in a new session directory under `temp` (the system temp by
+    default); does not wait for its server, `Session.wait` does.
+
+    `env` is the environment to start from, `os.environ` by default: `maya.exe` and the dcc-mcp
+    `.mod` are found by it, and the Maya's environment is made of it (see the module docstring).
+    `record` writes `state.json`, so that `status`, `exec` and `stop` find the session; `ttl` is in idle
+    minutes, 0 for none."""
+    base = os.environ if env is None else env
+    exe = maya_exe(base)
+    if not exe.is_file():
+        raise StartError(f"no Maya at {exe}; set MAYAPY_EXE or MAYA_LOCATION")
+    module = module_file(base)
+    if not module.is_file():
+        raise StartError(f"no dcc-mcp-maya module at {module}; set {MODULE_VARIABLE} to its .mod file")
+    root = make_session_dir(params.project, temp or Path(tempfile.gettempdir()))
+    try:
+        port = free_port()
+        maya = process.MayaProcess(exe, prepare(root, params, module, base, port, ttl), visible, next(NUMBERS))
+    except BaseException:  # Ctrl+C too: remove_stale keeps a directory without state.json for a day
+        shutil.rmtree(root, ignore_errors=True)
+        raise
+    started = Session(root, maya, f"http://127.0.0.1:{port}/mcp")
+    try:
+        for log in transport.server_logs(maya.pid):  # Windows reuses pids: a stale log holds a stale address
+            log.unlink(missing_ok=True)
+        if record:
+            state = State(
+                params.project,
+                str(params.project_root),
+                os.getpid(),
+                maya.pid,
+                started.url,
+                time.time(),
+                ttl,
+                maya.created,
+            )
+            write_state(root, state)
+    except BaseException:
+        started.close()
+        raise
+    return started
