@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -22,7 +21,7 @@ from typing import Any
 
 from . import config, process, session, transport
 from . import run as scenario_run
-from .session import Record, State
+from .session import Record
 
 CALL_TIMEOUT = 900  # seconds per `exec`
 QUIT_TIMEOUT = 60  # seconds for a quitting Maya to exit
@@ -100,6 +99,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return commands[args.command](args)
     except (
         NotRun,
+        session.StartError,
         config.ConfigError,
         scenario_run.Refused,
         transport.TransportError,
@@ -129,41 +129,13 @@ def maya_and_module() -> tuple[Path, Path]:
 
 def start(args: argparse.Namespace) -> int:
     project = config.load(Path.cwd())
-    maya_exe, module = maya_and_module()
     if args.ttl < 0:
         raise NotRun("--ttl takes 0 or more minutes")
-
-    root = session.make_session_dir(project.project, temp_dir())
-    port = session.free_port()
-    url = f"http://127.0.0.1:{port}/mcp"
-    work = root / "work"
-    maya: process.MayaProcess | None = None
-    kept = False
-    try:
-        env = session.prepare(root, project.params(), module, os.environ, port, args.ttl)
-        maya = process.MayaProcess(maya_exe, env, args.visible)
-        for log in transport.server_logs(maya.pid):
-            log.unlink(missing_ok=True)
-        state = State(
-            project.project, str(project.root), os.getpid(), maya.pid, url, time.time(), args.ttl, maya.created
-        )
-        session.write_state(root, state)
-        try:
-            transport.wait_for_server(url, work, maya.running, transport.STARTUP_TIMEOUT)
-            transport.connect(url, transport.STARTUP_TIMEOUT, work)
-        except (transport.TransportError, TimeoutError, OSError) as error:
-            titles = maya.window_titles() if maya.running() else []
-            logs = [str(log) for log in transport.server_logs(maya.pid)]
-            raise NotRun(f"Maya {maya.pid} did not start: {error}; its windows {titles}; its logs {logs}") from error
-        maya.release()
-        kept = True
-        pid = maya.pid
-    finally:
-        if not kept:
-            if maya is not None:
-                maya.close()
-            shutil.rmtree(root, ignore_errors=True)
-    print(f"Maya {pid} of {project.project} is running at {url}")
+    params = project.params()
+    with session.start(params, visible=args.visible, ttl=args.ttl, record=True, temp=temp_dir()) as running:
+        running.wait(transport.STARTUP_TIMEOUT)
+        running.release()
+    print(f"Maya {running.pid} of {project.project} is running at {running.url}")
     return OK
 
 
