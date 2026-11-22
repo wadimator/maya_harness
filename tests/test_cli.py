@@ -3,12 +3,12 @@ from pathlib import Path
 import pytest
 
 from maya_harness import cli, session, transport
-from maya_harness.session import Session, State
+from maya_harness.session import Record, State
 
 
-def make(root: str, started: float, project: str = "ue_exporter") -> Session:
+def make(root: str, started: float, project: str = "ue_exporter") -> Record:
     state = State(project, str(Path(root)), 1, 2, f"http://127.0.0.1:{int(started)}/mcp", started)
-    return Session(Path("C:/temp") / f"maya_harness_{started}", state)
+    return Record(Path("C:/temp") / f"maya_harness_{started}", state)
 
 
 def test_exec_parses_code_url_and_flags() -> None:

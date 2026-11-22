@@ -22,7 +22,7 @@ from typing import Any
 
 from . import config, process, session, transport
 from . import run as scenario_run
-from .session import Session, State
+from .session import Record, State
 
 CALL_TIMEOUT = 900  # seconds per `exec`
 QUIT_TIMEOUT = 60  # seconds for a quitting Maya to exit
@@ -167,13 +167,13 @@ def start(args: argparse.Namespace) -> int:
     return OK
 
 
-def find_project_sessions(found: list[Session], root: Path) -> list[Session]:
+def find_project_sessions(found: list[Record], root: Path) -> list[Record]:
     """The sessions started from the project at `root`, the latest last. By the project root, not
     the project name: a worktree has the same name, and its Maya has the other tree on sys.path."""
     return [item for item in found if Path(item.state.project_root) == root]
 
 
-def select(url: str | None) -> tuple[str, Session | None]:
+def select(url: str | None) -> tuple[str, Record | None]:
     """The address to call: `url`, or the latest live session of the project here."""
     found = session.sessions(temp_dir())
     if url:
@@ -300,7 +300,7 @@ def stop(args: argparse.Namespace) -> int:
     return FAILED if running else OK
 
 
-def describe(item: Session, now: float) -> dict[str, Any]:
+def describe(item: Record, now: float) -> dict[str, Any]:
     last_call = item.work / "last_call"
     try:
         idle_since = last_call.stat().st_mtime

@@ -135,7 +135,9 @@ class State:
 
 
 @dataclass(frozen=True)
-class Session:
+class Record:
+    """A session found on disk: its directory and its state.json."""
+
     root: Path
     state: State
 
@@ -246,13 +248,13 @@ def remove_stale(
     return removed
 
 
-def sessions(temp: Path, maya: Callable[[int, int], bool] = maya_alive) -> list[Session]:
+def sessions(temp: Path, maya: Callable[[int, int], bool] = maya_alive) -> list[Record]:
     """The sessions whose Maya is alive, the latest started last."""
     found = []
     for root in temp.glob(f"{PREFIX}*"):
         state = read_state(root) if root.is_dir() else None
         if state is not None and maya(state.maya_pid, state.maya_created):
-            found.append(Session(root, state))
+            found.append(Record(root, state))
     return sorted(found, key=lambda session: session.state.started)
 
 
