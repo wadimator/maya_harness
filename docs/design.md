@@ -8,7 +8,7 @@
 | Модуль | Что делает |
 | --- | --- |
 | `process.py` | процесс Maya: скрытый рабочий стол, job object, приоритет, процессоры |
-| `session.py` | каталог сеанса, окружение Maya, `userSetup.py`, `state.json`, уборка |
+| `session.py` | каталог сеанса, окружение Maya, `userSetup.py`, `state.json`, уборка; сеанс как API: `start`, `wait` |
 | `transport.py` | всё про dcc-mcp: ожидание сервера, рукопожатие, маркер, вызов кода, `maya-busy` |
 | `config.py` | `[tool.maya_harness]` из `pyproject.toml` проекта |
 | `run.py` | сценарии проверок: таблица прогонов, вердикт контроля, пул Maya команды `run` |
