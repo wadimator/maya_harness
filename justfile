@@ -29,6 +29,10 @@ fmt-check:
 sync:
     uv sync --frozen --exact
 
+# Local only: push and the release are by hand, see docs/contributing.md.
+release-prep version:
+    uv run --frozen --exact python scripts/release.py {{version}}
+
 # Once per clone: git runs the hooks from hooks/ of the working tree.
 install-hooks:
     git config --local core.hooksPath hooks

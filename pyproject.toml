@@ -40,9 +40,11 @@ select = ["E", "F", "I", "UP", "B"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --import-mode=importlib"
+pythonpath = ["scripts"]
 
 [tool.mypy]
 python_version = "3.11"
 strict = true
 packages = ["maya_harness"]
-mypy_path = "src"
+modules = ["release"]
+mypy_path = ["src", "scripts"]
