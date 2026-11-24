@@ -1,10 +1,15 @@
 import os
 import shutil
 import subprocess
+import threading
+from collections.abc import Callable
 from pathlib import Path
 
 from maya_harness import process
 from maya_harness.process import affinity_mask, environment_block
+
+CREATE_NO_WINDOW = 0x08000000
+PROCESS_ALL_ACCESS = 0x1FFFFF
 
 
 def test_affinity_spares_the_first_cpus_above_eight() -> None:
@@ -65,3 +70,38 @@ def test_kill_maya_kills_only_our_maya(tmp_path: Path) -> None:
     finally:
         child.kill()
         process.kernel32.CloseHandle(handle)
+
+
+GRANDCHILD = f"""
+import subprocess, sys
+sys.stdin.readline()  # started once the stub is in the job
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], creationflags={CREATE_NO_WINDOW})
+print(child.pid, flush=True)
+sys.stdin.readline()
+"""
+
+
+def test_a_released_maya_takes_what_it_started_along_when_killed(stub: Callable[..., subprocess.Popen[str]]) -> None:
+    """The license agents of a real Maya stand in a grandchild here. A `MayaProcess` runs only
+    maya.exe (`-hideConsole`), so the stub is put in a job of its own the way `MayaProcess` does."""
+    child = stub(GRANDCHILD, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    maya = object.__new__(process.MayaProcess)
+    maya.desktop, maya.closed, maya._lock = None, False, threading.Lock()
+    maya.job = process.kernel32.CreateJobObjectW(None, None)
+    maya._set_job_limits(process.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+    maya.handle = process.kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, child.pid)
+    assert process.kernel32.AssignProcessToJobObject(maya.job, maya.handle)
+    assert child.stdin and child.stdout
+    child.stdin.write("\n")
+    child.stdin.flush()
+    pid = int(child.stdout.readline())
+    grandchild = process.kernel32.OpenProcess(process.PROCESS_TERMINATE | process.SYNCHRONIZE, False, pid)
+    try:
+        maya.release()
+        assert child.poll() is None  # the job no longer closes with the harness
+        child.kill()
+        child.wait(5)
+        assert process.kernel32.WaitForSingleObject(grandchild, 5000) == 0
+    finally:
+        process.kernel32.TerminateProcess(grandchild, 1)
+        process.kernel32.CloseHandle(grandchild)

@@ -5,8 +5,9 @@
 * The job kills Maya, and everything Maya started, when its handle closes: on an error, on
   Ctrl+C and when the harness itself is killed. Not a `quit`: the settings of this Maya are thrown
   away with its directory, and a kill does not hang on a modal dialog. A Maya left running by
-  `release` is out of the job; it is closed by a deferred `quit` instead, and a Maya that does
-  not take it `stop` kills, once its image and creation time show the pid is still that Maya.
+  `release` holds its own job: the job closes, and kills what Maya started, when Maya dies.
+  Without it, a killed Maya leaves its two `AdskLicensingAgent.exe` for minutes, and they keep
+  its hidden desktop.
 * The job runs Maya below normal priority and, on more than 8 logical CPUs, off the first
   `SPARED_CPUS` of them: the PC stays usable while Maya works.
 * Maya is created suspended and put in the job before its first instruction: nothing it starts
@@ -43,6 +44,7 @@ JOB_OBJECT_LIMIT_PRIORITY_CLASS = 0x20
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
 BELOW_NORMAL_PRIORITY_CLASS = 0x4000
 JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9
+DUPLICATE_SAME_ACCESS = 0x2
 
 
 class STARTUPINFOW(ctypes.Structure):
@@ -155,6 +157,16 @@ kernel32.QueryFullProcessImageNameW.argtypes = [
     ctypes.POINTER(wintypes.DWORD),
 ]
 kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+kernel32.DuplicateHandle.argtypes = [
+    wintypes.HANDLE,
+    wintypes.HANDLE,
+    wintypes.HANDLE,
+    ctypes.POINTER(wintypes.HANDLE),
+    wintypes.DWORD,
+    wintypes.BOOL,
+    wintypes.DWORD,
+]
 
 
 def _checked(result: object) -> object:
@@ -261,18 +273,32 @@ class MayaProcess:
             self._close_handles()
 
     def release(self) -> None:
-        """Lets Maya outlive the harness: the job no longer kills it, and the desktop stays while
-        Maya is on it."""
+        """Lets Maya outlive the harness: Maya holds its own job, which closes with Maya and kills
+        what Maya started; the desktop stays while Maya is on it. If Maya cannot take the job,
+        closing ours kills Maya, and the error goes on."""
         with self._lock:
             self.closed = True
-            self._set_job_limits(0)
-            kernel32.CloseHandle(self.job)
-            self._close_handles()
+            try:
+                give(self.job, self.handle)
+            finally:
+                kernel32.CloseHandle(self.job)
+                self._close_handles()
 
     def _close_handles(self) -> None:
         kernel32.CloseHandle(self.handle)
         if self.desktop:
             user32.CloseDesktop(self.desktop)
+
+
+def give(handle: object, owner: object) -> None:
+    """Copies `handle` into the process `owner`, not inheritable: what it holds lives while
+    `owner` does, and none of the processes `owner` starts holds it. The caller may close its own."""
+    copy = wintypes.HANDLE()
+    _checked(
+        kernel32.DuplicateHandle(
+            kernel32.GetCurrentProcess(), handle, owner, ctypes.byref(copy), 0, False, DUPLICATE_SAME_ACCESS
+        )
+    )
 
 
 def creation_time(handle: object) -> int:
