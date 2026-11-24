@@ -23,7 +23,8 @@
   killed and its session directory removed at once, any left at the end too; a session writes no
   `state.json`, so `exec` and `stop` never pick a Maya of a run.
 * Each Maya is started and waited for in its own worker, not all started first and closed at
-  the end: a worker that cannot start its Maya yet holds up no other, and a Maya with nothing
+  the end: a worker that cannot start its Maya yet (every slot of the machine is taken, see
+  `slots`) holds up no other, and a Maya with nothing
   left to run holds nothing up to the end of the run.
 * Mayas at once: on 8 cores / 16 threads 3 Mayas slow a scenario by 14%, 4 by 19%, 7 by 16-60%
   (Retarget_Master, 2026).
@@ -258,6 +259,7 @@ class Pool:
         visible: bool,
         temp: Path,
         out: TextIO,
+        slot_wait: float | None = None,
     ) -> None:
         self.runs = runs
         self.codes = codes
@@ -266,6 +268,7 @@ class Pool:
         self.visible = visible
         self.temp = temp
         self.out = out
+        self.slot_wait = slot_wait
         self.queue: queue.Queue[int] = queue.Queue()
         for index in range(len(runs)):
             self.queue.put(index)
@@ -302,7 +305,7 @@ class Pool:
         if self.queue.empty():
             return
         try:
-            started = session.start(self.params, visible=self.visible, temp=self.temp)
+            started = session.start(self.params, visible=self.visible, temp=self.temp, slot_wait=self.slot_wait)
         except (session.StartError, OSError) as error:
             self.say(f"{name}: {error}", sys.stderr)
             return
@@ -380,9 +383,10 @@ def run_in_pool(
     visible: bool,
     temp: Path,
     out: TextIO,
+    slot_wait: float | None = None,
 ) -> Pool:
     """Runs `runs` in up to `count` Mayas; each is closed when it leaves, any left at the end too."""
-    pool = Pool(runs, codes, count, project.params(), visible, temp, out)
+    pool = Pool(runs, codes, count, project.params(), visible, temp, out, slot_wait)
     try:
         pool.run()
     finally:  # Ctrl+C, an error: the workers are daemons and may still hold their Mayas

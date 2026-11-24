@@ -184,6 +184,7 @@ def installed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     (tmp_path / "x.mod").write_text("+ MAYAVERSION:2025 PLATFORM:win64 dcc_mcp_maya 1 C:/m\n", encoding="utf-8")
     monkeypatch.setenv("MAYAPY_EXE", str(tmp_path / "mayapy.exe"))
     monkeypatch.setenv(session.MODULE_VARIABLE, str(tmp_path / "x.mod"))
+    monkeypatch.setattr(session.process, "give", lambda *_: None)  # a fake Maya has no process to hold a slot
 
 
 def test_run_removes_the_session_of_a_maya_that_failed_to_start(
@@ -205,6 +206,7 @@ def test_the_pool_starts_each_maya_on_a_desktop_of_its_own(
     class Maya:
         def __init__(self, exe: Path, env: dict[str, str], visible: bool, number: int) -> None:
             self.pid = number
+            self.handle = self.created = 0
             desktops.add(number)
 
         def running(self) -> bool:

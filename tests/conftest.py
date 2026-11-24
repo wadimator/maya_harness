@@ -1,11 +1,24 @@
 import subprocess
 import sys
 from collections.abc import Callable, Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
 
+from maya_harness import slots
+
 CREATE_NO_WINDOW = 0x08000000
+
+
+@pytest.fixture(autouse=True)
+def own_slots(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Slots of the test, not of the machine: with every slot of the machine taken by real Mayas,
+    a test that starts a fake one would wait for a slot without a limit."""
+    directory = tmp_path / "slots"
+    monkeypatch.setattr(slots, "DIR", directory)
+    monkeypatch.delenv(slots.VARIABLE, raising=False)
+    return directory
 
 
 @pytest.fixture
