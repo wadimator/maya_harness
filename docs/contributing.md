@@ -37,7 +37,8 @@
 
 * `main` — единственная долгоживущая ветка; остальное — `<тип>/<кратко>` от `main`, тип из
   таблицы.
-* Мелочь — прямо в `main`: одна атомарная правка без смены поведения (`docs`, `style`).
+* Мелочь — прямо в `main`: одна атомарная правка без смены поведения (`docs`, `style`);
+  ещё коммит версии `build(version)` — «Версия и релиз».
 * После каждого коммита `just check` зелёный.
 * Пока ветка не опубликована, служебные коммиты схлопываются в осмысленные ребейзом.
 
@@ -60,13 +61,17 @@
 
 ## Версия и релиз
 
-Версия — `[project].version` в `pyproject.toml`, выпуск — тег `vX.Y.Z` на merge-коммите в
-`main` и GitHub Release с колесом этого тега: плагины ставят пакет только готовым колесом
-([README.md](../README.md), «Установка»).
+Версия — `[project].version` в `pyproject.toml`. Выпуск — один коммит
+`build(version): A -> X.Y.Z` в `main` после мёрджа: версия в `pyproject.toml` и `uv.lock` и
+ссылка на колесо в [README.md](../README.md), «Установка». На этом коммите — тег `vX.Y.Z` и
+GitHub Release с колесом этого тега: плагины ставят пакет только готовым колесом.
 
 ```powershell
-uv build --wheel -o dist
-gh release create vX.Y.Z dist/maya_harness-X.Y.Z-py3-none-any.whl
+just release-prep X.Y.Z        # коммит версии с README, тег, колесо, черновик описания
+# отредактировать dist/release-notes-vX.Y.Z.md, удалить строку-маркер
+git push --atomic origin main vX.Y.Z
+gh release create vX.Y.Z dist/maya_harness-X.Y.Z-py3-none-any.whl --verify-tag --title vX.Y.Z --notes-file dist/release-notes-vX.Y.Z.md
 ```
 
-Push и релиз — только руками разработчика: рецептов для них нет.
+Push и релиз — только руками разработчика: `release-prep` ничего не отправляет. Сбой до коммита
+откатывает правки — запусти снова; потерянное колесо — `uv build --wheel -o dist` на теге.

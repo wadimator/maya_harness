@@ -20,6 +20,8 @@ maya_harness — пакет и команда `maya-harness`: изолирова
   типы: `just types` (strict)
 * Окружение: `just sync` — `uv sync --frozen --exact`; хуки: `just install-hooks` — один раз в
   свежем клоне
+* Выпуск версии: `just release-prep X.Y.Z` — коммит версии, тег, колесо, черновик описания;
+  push и релиз — руками ([docs/contributing.md](docs/contributing.md), «Версия и релиз»)
 * Запуск: `uv run --frozen --exact maya-harness <команда>` — `start`, `stop`, `status`,
   `exec`, `doctor`; **требует Maya 2025 и dcc-mcp-maya**
 
