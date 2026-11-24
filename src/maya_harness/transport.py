@@ -37,7 +37,6 @@ BUSY_RETRY = 0.5  # seconds between the repeats of a call refused with maya-busy
 STARTUP_TIMEOUT = 180  # seconds for a Maya to start and connect; a cold start takes 12-15
 LOG_DIR = Path(os.environ.get("LOCALAPPDATA", "")) / "dcc-mcp" / "log"
 MARKER_CODE = "import json, os\njson.dumps(os.environ.get('MAYA_HARNESS_WORK', ''))"
-QUIT_CODE = "import maya.cmds as cmds\ncmds.evalDeferred(lambda: cmds.quit(force=True), lowestPriority=True)"
 
 
 class TransportError(RuntimeError):

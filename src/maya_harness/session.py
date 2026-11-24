@@ -34,10 +34,13 @@
   UserSetup Checksum verification», since `userSetup.py` is new in every session. A
   `userPrefs.mel` written in advance does not do it: Maya's first start in a new settings
   directory ignores it and writes its own.
+* Every Maya holds a slot of this machine (`slots`): `start` takes one first, waiting for it
+  while all are taken, and hands it to Maya; it comes free when Maya dies.
 * As a library: `start` makes the directory and starts Maya, `Session.wait` waits for its
-  server. `start` does not wait, so a pool starts all its Mayas at once and waits for each in a
-  worker of its own. `Session.close` kills Maya and removes the directory; `Session.release`
-  leaves both, for a Maya that outlives this process (`maya-harness start`).
+  server. `start` does not wait: a worker of a pool that finds nothing left to run once its Maya
+  has started closes it without waiting for the server. `Session.close` kills Maya and removes
+  the directory; `Session.release` leaves both, for a Maya that outlives this process
+  (`maya-harness start`).
 """
 
 from __future__ import annotations
@@ -53,7 +56,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from . import process, transport
+from . import process, slots, transport
 from .process import maya_alive, process_alive
 
 PREFIX = "maya_harness_"
@@ -391,14 +394,19 @@ def start(
     ttl: int = 0,
     record: bool = False,
     temp: Path | None = None,
+    slot_wait: float | None = None,
+    slot_unneeded: Callable[[], bool] | None = None,
 ) -> Session:
-    """Starts a Maya of `params` in a new session directory under `temp` (the system temp by
-    default); does not wait for its server, `Session.wait` does.
+    """Takes a slot of this machine (`slots`), then starts a Maya of `params` in a new session
+    directory under `temp` (the system temp by default); does not wait for its server,
+    `Session.wait` does.
 
     `env` is the environment to start from, `os.environ` by default: `maya.exe` and the dcc-mcp
     `.mod` are found by it, and the Maya's environment is made of it (see the module docstring).
     `record` writes `state.json`, so that `status`, `exec` and `stop` find the session; `ttl` is in idle
-    minutes, 0 for none."""
+    minutes, 0 for none. `slot_wait` is how many seconds to wait for a free slot, None for no
+    limit; StartError when none came free. `slot_unneeded`, asked while it waits, ends the wait
+    with StartError once it is True."""
     base = os.environ if env is None else env
     exe = maya_exe(base)
     if not exe.is_file():
@@ -406,15 +414,35 @@ def start(
     module = module_file(base)
     if not module.is_file():
         raise StartError(f"no dcc-mcp-maya module at {module}; set {MODULE_VARIABLE} to its .mod file")
-    root = make_session_dir(params.project, temp or Path(tempfile.gettempdir()))
+    try:
+        slot = slots.take(slot_wait, unneeded=slot_unneeded)
+    except slots.NoSlot as error:
+        raise StartError(str(error)) from error
+    try:
+        root = make_session_dir(params.project, temp or Path(tempfile.gettempdir()))
+    except BaseException:
+        slot.release()
+        raise
     try:
         port = free_port()
         maya = process.MayaProcess(exe, prepare(root, params, module, base, port, ttl), visible, next(NUMBERS))
     except BaseException:  # Ctrl+C too: remove_stale keeps a directory without state.json for a day
         shutil.rmtree(root, ignore_errors=True)
+        slot.release()
         raise
     started = Session(root, maya, f"http://127.0.0.1:{port}/mcp")
     try:
+        slot.give(maya.handle)  # here: on an error, the except below kills Maya
+        holder = {
+            "pid": maya.pid,
+            "created": maya.created,
+            "project": params.project,
+            "command": "start" if record else "run",
+            "url": started.url,
+            "work": str(started.work),
+            "time": time.time(),
+        }
+        slot.describe(holder)
         for log in transport.server_logs(maya.pid):  # Windows reuses pids: a stale log holds a stale address
             log.unlink(missing_ok=True)
         if record:
@@ -431,5 +459,6 @@ def start(
             write_state(root, state)
     except BaseException:
         started.close()
+        slot.release()
         raise
     return started

@@ -5,12 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from maya_harness import session
+from maya_harness import process, session, slots
 from maya_harness.session import SessionParams, State
 
 PROJECT = "Retarget_Master"  # `_` in the name: the directory name cannot be split into a pid
 DEAD, ALIVE, OTHER_ALIVE = 101, 202, 303
 NOW = 1_000_000_000.0
+GIVE = process.give  # the real one: `installed` replaces it
 
 
 def alive(pid: int) -> bool:
@@ -240,6 +241,7 @@ class FakeMaya:
     def __init__(self, exe: Path, env: dict[str, str], visible: bool = False, number: int = 1) -> None:
         self.pid = 4242
         self.created = 7
+        self.handle = 0
         self.closed = False
         self.released = False
 
@@ -265,6 +267,7 @@ def installed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     monkeypatch.setenv("MAYAPY_EXE", str(tmp_path / "mayapy.exe"))
     monkeypatch.setenv(session.MODULE_VARIABLE, str(tmp_path / "dcc_mcp_maya.mod"))
     monkeypatch.setattr(session.process, "MayaProcess", FakeMaya)
+    monkeypatch.setattr(session.process, "give", lambda *_: None)  # a fake Maya has no process to hold a slot
     monkeypatch.setattr(session.transport, "server_logs", lambda pid: [])
     temp = tmp_path / "temp"
     temp.mkdir()
@@ -349,3 +352,61 @@ def test_execute_touches_last_call(installed: Path, monkeypatch: pytest.MonkeyPa
         os.utime(last_call, (NOW, NOW))
         assert started.execute("1", 1).success
         assert last_call.stat().st_mtime > NOW
+
+
+def slot_free() -> bool:
+    slot = slots.try_take()
+    if slot is None:
+        return False
+    slot.release()
+    return True
+
+
+def test_a_start_that_fails_before_maya_holds_the_slot_frees_it(
+    installed: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(slots.VARIABLE, "1")
+
+    def broken(*args: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(session, "prepare", broken)
+    with pytest.raises(OSError, match="disk full"):
+        session.start(STARTED, temp=installed)
+    assert slot_free()
+    assert session_dirs(installed) == []
+
+
+def test_a_maya_that_cannot_take_the_slot_is_closed_and_the_slot_freed(
+    installed: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(slots.VARIABLE, "1")
+    closed: list[FakeMaya] = []
+
+    class Maya(FakeMaya):
+        def close(self) -> None:
+            closed.append(self)
+
+    monkeypatch.setattr(session.process, "MayaProcess", Maya)
+    monkeypatch.setattr(session.process, "give", GIVE)  # the fake Maya has no process: it fails
+    with pytest.raises(OSError):
+        session.start(STARTED, temp=installed)
+    assert len(closed) == 1
+    assert slot_free()
+    assert session_dirs(installed) == []
+
+
+def test_start_gives_up_when_no_slot_comes_free(installed: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(slots.VARIABLE, "1")
+    held = slots.take(0)
+    with pytest.raises(session.StartError, match="Maya slots stayed taken"):
+        session.start(STARTED, temp=installed, slot_wait=0.1)
+    assert session_dirs(installed) == []
+    held.release()
+
+
+def test_start_names_the_holder_of_its_slot(installed: Path) -> None:
+    with session.start(STARTED, temp=installed, record=True) as started:
+        holder = json.loads((slots.DIR / "slot-1.holder").read_text(encoding="utf-8"))
+    assert holder["pid"] == 4242 and holder["created"] == 7 and holder["command"] == "start"
+    assert (holder["project"], holder["url"], holder["work"]) == (PROJECT, started.url, str(started.work))

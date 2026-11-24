@@ -5,8 +5,9 @@
 * The job kills Maya, and everything Maya started, when its handle closes: on an error, on
   Ctrl+C and when the harness itself is killed. Not a `quit`: the settings of this Maya are thrown
   away with its directory, and a kill does not hang on a modal dialog. A Maya left running by
-  `release` is out of the job; it is closed by a deferred `quit` instead, and a Maya that does
-  not take it `stop` kills, once its image and creation time show the pid is still that Maya.
+  `release` holds its own job: the job closes, and kills what Maya started, when Maya dies.
+  Without it, a killed Maya leaves its two `AdskLicensingAgent.exe` for minutes, and they keep
+  its hidden desktop.
 * The job runs Maya below normal priority and, on more than 8 logical CPUs, off the first
   `SPARED_CPUS` of them: the PC stays usable while Maya works.
 * Maya is created suspended and put in the job before its first instruction: nothing it starts
@@ -43,6 +44,10 @@ JOB_OBJECT_LIMIT_PRIORITY_CLASS = 0x20
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
 BELOW_NORMAL_PRIORITY_CLASS = 0x4000
 JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9
+DUPLICATE_SAME_ACCESS = 0x2
+DESKTOP_READOBJECTS = 0x1
+DESKTOP_ENUMERATE = 0x40
+DESKTOP_PREFIX = "maya_harness_"
 
 
 class STARTUPINFOW(ctypes.Structure):
@@ -142,6 +147,11 @@ user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintyp
 user32.IsWindowVisible.argtypes = [wintypes.HWND]
 user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
 user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+DESKENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.LPWSTR, wintypes.LPARAM)
+user32.GetProcessWindowStation.restype = wintypes.HANDLE
+user32.EnumDesktopsW.argtypes = [wintypes.HANDLE, DESKENUMPROC, wintypes.LPARAM]
+user32.OpenDesktopW.restype = wintypes.HANDLE
+user32.OpenDesktopW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 kernel32.OpenProcess.restype = wintypes.HANDLE
 kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
@@ -155,6 +165,16 @@ kernel32.QueryFullProcessImageNameW.argtypes = [
     ctypes.POINTER(wintypes.DWORD),
 ]
 kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+kernel32.DuplicateHandle.argtypes = [
+    wintypes.HANDLE,
+    wintypes.HANDLE,
+    wintypes.HANDLE,
+    ctypes.POINTER(wintypes.HANDLE),
+    wintypes.DWORD,
+    wintypes.BOOL,
+    wintypes.DWORD,
+]
 
 
 def _checked(result: object) -> object:
@@ -190,7 +210,7 @@ class MayaProcess:
         startup = STARTUPINFOW(cb=ctypes.sizeof(STARTUPINFOW))
         self.desktop = None
         if not visible:
-            name = f"maya_harness_{os.getpid()}_{number}"
+            name = f"{DESKTOP_PREFIX}{os.getpid()}_{number}"
             self.desktop = _checked(user32.CreateDesktopW(name, None, None, 0, GENERIC_ALL, None))
             startup.lpDesktop = f"WinSta0\\{name}"
         self.job = _checked(kernel32.CreateJobObjectW(None, None))
@@ -235,20 +255,7 @@ class MayaProcess:
 
     def window_titles(self) -> list[str]:
         """Maya's visible windows: on the hidden desktop a modal dialog is seen only this way."""
-        titles: list[str] = []
-
-        def collect(window: int, _: int) -> bool:
-            owner = wintypes.DWORD()
-            user32.GetWindowThreadProcessId(window, ctypes.byref(owner))
-            if owner.value == self.pid and user32.IsWindowVisible(window) and user32.GetWindowTextLengthW(window):
-                title = ctypes.create_unicode_buffer(512)
-                user32.GetWindowTextW(window, title, len(title))
-                titles.append(title.value)
-            return True
-
-        desktop = self.desktop or user32.GetThreadDesktop(kernel32.GetCurrentThreadId())
-        user32.EnumDesktopWindows(desktop, WNDENUMPROC(collect), 0)
-        return titles
+        return window_titles(self.pid, self.desktop or user32.GetThreadDesktop(kernel32.GetCurrentThreadId()))
 
     def close(self) -> None:
         """Kills whatever is still running in the job, then lets go of the desktop. Once."""
@@ -261,18 +268,71 @@ class MayaProcess:
             self._close_handles()
 
     def release(self) -> None:
-        """Lets Maya outlive the harness: the job no longer kills it, and the desktop stays while
-        Maya is on it."""
+        """Lets Maya outlive the harness: Maya holds its own job, which closes with Maya and kills
+        what Maya started; the desktop stays while Maya is on it. If Maya cannot take the job,
+        closing ours kills Maya, and the error goes on."""
         with self._lock:
             self.closed = True
-            self._set_job_limits(0)
-            kernel32.CloseHandle(self.job)
-            self._close_handles()
+            try:
+                give(self.job, self.handle)
+            finally:
+                kernel32.CloseHandle(self.job)
+                self._close_handles()
 
     def _close_handles(self) -> None:
         kernel32.CloseHandle(self.handle)
         if self.desktop:
             user32.CloseDesktop(self.desktop)
+
+
+def window_titles(pid: int, desktop: object = None) -> list[str]:
+    """The visible windows of process `pid` that have a title (Maya has visible ones without),
+    on `desktop`; without it, on every hidden desktop of maya_harness and on the current one:
+    the Maya of another harness process is on a desktop this one did not make."""
+    if desktop is not None:
+        return _titles_on(desktop, pid)
+    names: list[str] = []
+
+    def collect(name: str, _: int) -> bool:
+        if name.startswith(DESKTOP_PREFIX):
+            names.append(name)
+        return True
+
+    user32.EnumDesktopsW(user32.GetProcessWindowStation(), DESKENUMPROC(collect), 0)
+    titles = _titles_on(user32.GetThreadDesktop(kernel32.GetCurrentThreadId()), pid)
+    for name in names:
+        handle = user32.OpenDesktopW(name, 0, False, DESKTOP_READOBJECTS | DESKTOP_ENUMERATE)
+        if handle:  # closed since it was listed
+            titles += _titles_on(handle, pid)
+            user32.CloseDesktop(handle)
+    return titles
+
+
+def _titles_on(desktop: object, pid: int) -> list[str]:
+    titles: list[str] = []
+
+    def collect(window: int, _: int) -> bool:
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(window, ctypes.byref(owner))
+        if owner.value == pid and user32.IsWindowVisible(window) and user32.GetWindowTextLengthW(window):
+            title = ctypes.create_unicode_buffer(512)
+            user32.GetWindowTextW(window, title, len(title))
+            titles.append(title.value)
+        return True
+
+    user32.EnumDesktopWindows(desktop, WNDENUMPROC(collect), 0)
+    return titles
+
+
+def give(handle: object, owner: object) -> None:
+    """Copies `handle` into the process `owner`, not inheritable: what it holds lives while
+    `owner` does, and none of the processes `owner` starts holds it. The caller may close its own."""
+    copy = wintypes.HANDLE()
+    _checked(
+        kernel32.DuplicateHandle(
+            kernel32.GetCurrentProcess(), handle, owner, ctypes.byref(copy), 0, False, DUPLICATE_SAME_ACCESS
+        )
+    )
 
 
 def creation_time(handle: object) -> int:

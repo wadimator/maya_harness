@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -19,16 +20,30 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from . import config, process, session, transport
+from . import config, process, session, slots, transport
 from . import run as scenario_run
 from .session import Record
 
 CALL_TIMEOUT = 900  # seconds per `exec`
-QUIT_TIMEOUT = 60  # seconds for a quitting Maya to exit
 DEFAULT_TTL = 60  # minutes
 PATCH_VARIABLE = "MAYA_HARNESS_DCC_MCP_PATCH"
 
 OK, FAILED, NOT_RUN = 0, 1, 2
+
+
+def seconds(text: str) -> float:
+    value = float(text)
+    if not value >= 0:  # nan too: a wait of nan seconds never ends
+        raise argparse.ArgumentTypeError(f"{text}: takes 0 or more seconds")
+    return value
+
+
+# Not --timeout: that would read as the time of a call.
+SLOT_WAIT: dict[str, Any] = {
+    "type": seconds,
+    "metavar": "SEC",
+    "help": "wait this long for a free Maya slot of this machine; without a limit by default",
+}
 
 
 class NotRun(Exception):
@@ -52,8 +67,9 @@ def parser() -> argparse.ArgumentParser:
         metavar="MIN",
         help=f"Maya quits after this many idle minutes, {DEFAULT_TTL} by default; 0 for never",
     )
+    start.add_argument("--slot-wait", **SLOT_WAIT)
 
-    stop = commands.add_parser("stop", help="quit a Maya; by default the latest one of this project")
+    stop = commands.add_parser("stop", help="kill a Maya; by default the latest one of this project")
     which = stop.add_mutually_exclusive_group()
     which.add_argument("url", nargs="?", help="the Maya at this address")
     which.add_argument("--project", action="store_true", help="every Maya of this project")
@@ -84,6 +100,7 @@ def parser() -> argparse.ArgumentParser:
     )
     scenarios.add_argument("--url", help="run in this Maya, which `start` left running")
     scenarios.add_argument("--visible", action="store_true", help="start the Maya on the usual desktop")
+    scenarios.add_argument("--slot-wait", **SLOT_WAIT)
     scenarios.add_argument("--json", action="store_true", help="the summary as one JSON line; the reports go to stderr")
 
     commands.add_parser("doctor", help="check Maya, the dcc-mcp module and its patch")
@@ -100,6 +117,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (
         NotRun,
         session.StartError,
+        slots.NoSlot,
         config.ConfigError,
         scenario_run.Refused,
         transport.TransportError,
@@ -121,7 +139,9 @@ def start(args: argparse.Namespace) -> int:
     if args.ttl < 0:
         raise NotRun("--ttl takes 0 or more minutes")
     params = project.params()
-    with session.start(params, visible=args.visible, ttl=args.ttl, record=True, temp=temp_dir()) as running:
+    with session.start(
+        params, visible=args.visible, ttl=args.ttl, record=True, temp=temp_dir(), slot_wait=args.slot_wait
+    ) as running:
         running.wait(transport.STARTUP_TIMEOUT)
         running.release()
     print(f"Maya {running.pid} of {project.project} is running at {running.url}")
@@ -205,7 +225,7 @@ def run_scenarios(args: argparse.Namespace) -> int:
         outcomes = scenario_run.run_at_url(args.url, work, runs, codes, out)
     else:
         count = 1 if args.visible else max(1, min(args.jobs, len(runs)))
-        pool = scenario_run.run_in_pool(project, runs, codes, count, args.visible, temp_dir(), out)
+        pool = scenario_run.run_in_pool(project, runs, codes, count, args.visible, temp_dir(), out, args.slot_wait)
         if not pool.ready:
             raise NotRun("no Maya started; see the errors above")
         outcomes = pool.outcomes
@@ -229,24 +249,22 @@ def stop(args: argparse.Namespace) -> int:
     if not targets:
         print("no running Maya to stop")
         return OK
-    unreachable = []
+    # A kill, not a `quit`: a busy Maya takes a quit only after its current call, one on a modal
+    # dialog never; the session is thrown away, so a quit has nothing to save. What Maya shows
+    # is printed first: a dialog on the hidden desktop is seen only this way.
+    running = False
+    now = time.time()
     for item in targets:
-        try:
-            transport.connect(item.state.url, QUIT_TIMEOUT, item.work)
-            transport.execute(item.state.url, transport.QUIT_CODE, QUIT_TIMEOUT)
-        except (transport.TransportError, OSError) as error:  # a modal dialog, a Maya gone
-            print(f"Maya {item.state.maya_pid} at {item.state.url} did not take quit: {error}", file=sys.stderr)
-            unreachable.append(item)
-    deadline = time.monotonic() + QUIT_TIMEOUT
-    left = [item for item in targets if item not in unreachable]
-    while left and time.monotonic() < deadline:
-        left = [item for item in left if process.process_alive(item.state.maya_pid)]
-        time.sleep(0.25)
-    killed = [item for item in left + unreachable if process.kill_maya(item.state.maya_pid, item.state.maya_created)]
-    running = [item for item in left + unreachable if item not in killed]
-    for item in targets:
-        outcome = "still running" if item in running else "killed" if item in killed else "closed"
-        print(f"Maya {item.state.maya_pid} at {item.state.url}: {outcome}")
+        pid = item.state.maya_pid
+        titles = ", ".join(process.window_titles(pid))
+        idle = describe(item, now)["idle"] // 60
+        print(f"Maya {pid} {item.state.url} {item.state.project}: idle {idle} min, windows [{titles}]", flush=True)
+        if process.kill_maya(pid, item.state.maya_created):
+            shutil.rmtree(item.root, ignore_errors=True)
+            print(f"Maya {pid}: killed")
+        else:  # the directory stays: its logs tell why
+            running = True
+            print(f"Maya {pid}: still running")
     return FAILED if running else OK
 
 
@@ -276,12 +294,15 @@ def status(args: argparse.Namespace) -> int:
         return OK
     if not rows:
         print("no running Maya of maya_harness")
-        return OK
     for row in rows:
         print(
             f"{row['project']:<20} pid {row['pid']:<6} {row['url']:<28} "
             f"age {row['age'] // 60} min, idle {row['idle'] // 60} min, ttl {row['ttl']} min  {row['project_root']}"
         )
+    taken = slots.holders()
+    print(f"Maya slots: {len(taken)} of {slots.count()} taken")
+    for holder in taken:
+        print(f"  {holder.line(now)}")
     return OK
 
 
