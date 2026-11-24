@@ -1,5 +1,6 @@
 """Slots on the directory of the test (`own_slots` in conftest.py); stubs stand in for Maya."""
 
+import os
 import subprocess
 import time
 from collections.abc import Callable
@@ -106,3 +107,65 @@ def test_a_failed_give_frees_the_slot(own_slots: Path, monkeypatch: pytest.Monke
     with pytest.raises(OSError):
         slot.give(0)  # no process
     assert free(own_slots)
+
+
+def test_a_waiting_harness_says_whom_it_waits_for(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """Polls 30 s apart: a miss, the holders, the same, the same a minute on, new holders, a slot."""
+    monkeypatch.setenv(slots.VARIABLE, "2")
+    now = [0.0]
+    monkeypatch.setattr(slots, "clock", lambda: now[0])
+    monkeypatch.setattr(slots, "pause", lambda seconds: now.__setitem__(0, now[0] + 30))
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "last_call").touch()
+    os.utime(work / "last_call", (time.time() - 600,) * 2)
+    started = slots.Holder(
+        1, 11, 1, "Retarget_Master", "start", "http://127.0.0.1:5/mcp", str(work), time.time() - 1200
+    )
+    running = slots.Holder(2, 22, 2, "UE_exporter", "run", "http://127.0.0.1:6/mcp", "", time.time() - 60)
+    after = slots.Holder(2, 33, 3, "UE_exporter", "run", "http://127.0.0.1:7/mcp", "", time.time())
+    tries = iter([None] * 5 + [slots.Slot(1, tmp_path / "slot-1", None)])
+    seen = iter([[started, running]] * 3 + [[started, after]])
+    monkeypatch.setattr(slots, "try_take", lambda directory=None: next(tries))
+    monkeypatch.setattr(slots, "holders", lambda directory=None: next(seen))
+    assert slots.take(None).number == 1
+    err = capsys.readouterr().err
+    assert err.count("all 2 Maya slots are taken, waiting for one:") == 2
+    assert (
+        "slot 1: Maya 11 Retarget_Master, start, 20 min, idle 10 min; free it: maya-harness stop http://127.0.0.1:5/mcp"
+        in err
+    )
+    assert "slot 2: Maya 22 UE_exporter, run, 1 min\n" in err
+    assert "slot 2: Maya 33 UE_exporter, run, 0 min\n" in err
+    assert err.count("still waiting for a Maya slot, 1 min") == 1
+    assert err.rstrip().endswith("got Maya slot 1 after 2.5 min")
+    assert all(
+        line.startswith(f"maya-harness {os.getpid()}: ") for line in err.splitlines() if not line.startswith("  ")
+    )
+
+
+def test_a_slot_found_on_the_second_try_is_taken_without_a_word(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """A probe of `status` takes a free slot for a moment: one miss is no reason to say all are taken."""
+    tries = iter([None, slots.Slot(1, tmp_path / "slot-1", None)])
+    monkeypatch.setattr(slots, "try_take", lambda directory=None: next(tries))
+    monkeypatch.setattr(slots, "pause", lambda seconds: None)
+    slots.take(None)
+    assert capsys.readouterr().err == ""
+
+
+def test_holders_are_the_taken_slots_only(own_slots: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A free slot keeps the .holder of its last Maya; a holder that is not a live Maya is starting."""
+    monkeypatch.setenv(slots.VARIABLE, "3")
+    first, second = slots.take(0), slots.take(0)
+    second.describe(
+        {"pid": os.getpid(), "created": 1, "project": "p", "command": "run", "url": "u", "work": "w", "time": 0}
+    )
+    first.describe({"pid": 1, "created": 1, "project": "p", "command": "run", "url": "u", "work": "w", "time": 0})
+    first.release()
+    assert slots.holders() == [slots.Holder(2)]
+    second.release()
+    assert slots.holders() == []

@@ -395,6 +395,7 @@ def start(
     record: bool = False,
     temp: Path | None = None,
     slot_wait: float | None = None,
+    slot_unneeded: Callable[[], bool] | None = None,
 ) -> Session:
     """Takes a slot of this machine (`slots`), then starts a Maya of `params` in a new session
     directory under `temp` (the system temp by default); does not wait for its server,
@@ -404,7 +405,8 @@ def start(
     `.mod` are found by it, and the Maya's environment is made of it (see the module docstring).
     `record` writes `state.json`, so that `status`, `exec` and `stop` find the session; `ttl` is in idle
     minutes, 0 for none. `slot_wait` is how many seconds to wait for a free slot, None for no
-    limit; StartError when none came free."""
+    limit; StartError when none came free. `slot_unneeded`, asked while it waits, ends the wait
+    with StartError once it is True."""
     base = os.environ if env is None else env
     exe = maya_exe(base)
     if not exe.is_file():
@@ -413,7 +415,7 @@ def start(
     if not module.is_file():
         raise StartError(f"no dcc-mcp-maya module at {module}; set {MODULE_VARIABLE} to its .mod file")
     try:
-        slot = slots.take(slot_wait)
+        slot = slots.take(slot_wait, unneeded=slot_unneeded)
     except slots.NoSlot as error:
         raise StartError(str(error)) from error
     try:

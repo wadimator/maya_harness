@@ -15,6 +15,12 @@
 * `slot-<n>.holder` is JSON only to show who holds a slot; it is read only while the slot is
   taken: a free slot may keep the one of a dead Maya. A holder whose Maya is not alive is still
   starting: the slot is taken, its `.holder` not yet written.
+* A harness that waits says whom it waits for, on stderr (stdout of `--json` is one JSON line):
+  every holder, and for a Maya of `start` its idle time and how to free its slot. Again in full
+  when the holders change, else a line a minute. One `write` a message, with the pid of the
+  waiting harness: the workers of a pool wait at once.
+* Telling a taken slot from a free one means opening it, which takes a free slot for a moment:
+  a harness that finds no free slot says so only when the next try finds none either.
 """
 
 from __future__ import annotations
@@ -22,8 +28,10 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import sys
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -35,6 +43,7 @@ DIR = Path(tempfile.gettempdir()) / "maya_harness" / "slots"
 VARIABLE = "MAYA_HARNESS_SLOTS"
 DEFAULT_COUNT = 4  # more than 4 Mayas on 8 cores / 16 threads slow each other down (Retarget_Master)
 POLL = 0.5  # seconds between the tries of a harness that waits for a slot
+REMINDER = 60  # seconds between the lines of a harness that still waits
 
 GENERIC_READ = 0x80000000
 OPEN_ALWAYS = 4
@@ -124,14 +133,109 @@ def try_take(directory: Path | None = None) -> Slot | None:
     return None
 
 
-def take(wait: float | None, directory: Path | None = None) -> Slot:
-    """Takes a free slot, waiting for one up to `wait` seconds, without a limit for None;
-    NoSlot when none came free."""
-    deadline = None if wait is None else time.monotonic() + wait
+@dataclass(frozen=True)
+class Holder:
+    """Who holds a taken slot, from its `.holder`; `pid` 0 for a Maya still starting."""
+
+    number: int
+    pid: int = 0
+    created: int = 0
+    project: str = ""
+    command: str = ""
+    url: str = ""
+    work: str = ""
+    since: float = 0.0
+
+    def line(self, now: float) -> str:
+        if not self.pid:
+            return f"slot {self.number}: a Maya starting"
+        text = f"slot {self.number}: Maya {self.pid} {self.project}, {self.command}, {(now - self.since) // 60:.0f} min"
+        if self.command == "start":
+            try:
+                idle_since = (Path(self.work) / "last_call").stat().st_mtime
+            except OSError:
+                idle_since = self.since
+            text += f", idle {(now - idle_since) // 60:.0f} min; free it: maya-harness stop {self.url}"
+        return text
+
+
+def holders(directory: Path | None = None) -> list[Holder]:
+    """The taken slots and who holds them."""
+    found = []
+    for number in range(1, count() + 1):
+        path = slot_file(number, directory)
+        if not path.exists():  # never taken
+            continue
+        handle = open_slot(path)  # for reading: an open with access 0 succeeds on a taken slot too
+        if handle is not None:  # free
+            kernel32.CloseHandle(handle)
+            continue
+        found.append(read_holder(number, path))
+    return found
+
+
+def read_holder(number: int, path: Path) -> Holder:
+    try:
+        data = json.loads(holder_file(path).read_text(encoding="utf-8"))
+        holder = Holder(
+            number,
+            int(data["pid"]),
+            int(data["created"]),
+            str(data["project"]),
+            str(data["command"]),
+            str(data["url"]),
+            str(data["work"]),
+            float(data["time"]),
+        )
+    except (OSError, ValueError, TypeError, KeyError):
+        return Holder(number)
+    return holder if process.maya_alive(holder.pid, holder.created) else Holder(number)
+
+
+def clock() -> float:
+    return time.monotonic()
+
+
+def pause(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def say(text: str) -> None:
+    sys.stderr.write(f"maya-harness {os.getpid()}: {text}\n")
+    sys.stderr.flush()
+
+
+def take(wait: float | None, directory: Path | None = None, unneeded: Callable[[], bool] | None = None) -> Slot:
+    """Takes a free slot, waiting for one up to `wait` seconds, without a limit for None, and
+    saying whom it waits for; NoSlot when none came free. `unneeded` is asked after every miss:
+    True ends the wait with NoSlot."""
+    began = clock()
+    deadline = None if wait is None else began + wait
+    misses = 0
+    shown: tuple[tuple[int, int, int], ...] | None = None
+    reminded = began
     while True:
         slot = try_take(directory)
         if slot is not None:
+            if shown is not None:
+                say(f"got Maya slot {slot.number} after {(clock() - began) / 60:.1f} min")
             return slot
-        if deadline is not None and time.monotonic() >= deadline:
+        now = clock()
+        if deadline is not None and now >= deadline:
             raise NoSlot(f"all {count()} Maya slots stayed taken for {wait:g} s; {VARIABLE} sets their number")
-        time.sleep(POLL if deadline is None else max(0.0, min(POLL, deadline - time.monotonic())))
+        if unneeded is not None and unneeded():
+            raise NoSlot("a Maya slot is no longer needed")
+        misses += 1
+        if misses > 1:
+            taken = holders(directory)
+            key = tuple((holder.number, holder.pid, holder.created) for holder in taken)
+            if key != shown:
+                wall = time.time()
+                lines = [f"all {count()} Maya slots are taken, waiting for one:"]
+                lines += [f"  {holder.line(wall)}" for holder in taken]
+                say("\n".join(lines))
+                shown, reminded = key, now
+            elif now - reminded >= REMINDER:
+                say(f"still waiting for a Maya slot, {(now - began) // 60:.0f} min")
+                reminded = now
+        pause(POLL if deadline is None else max(0.0, min(POLL, deadline - now)))

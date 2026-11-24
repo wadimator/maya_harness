@@ -24,8 +24,8 @@
   `state.json`, so `exec` and `stop` never pick a Maya of a run.
 * Each Maya is started and waited for in its own worker, not all started first and closed at
   the end: a worker that cannot start its Maya yet (every slot of the machine is taken, see
-  `slots`) holds up no other, and a Maya with nothing
-  left to run holds nothing up to the end of the run.
+  `slots`) holds up no other, and a Maya with nothing left to run holds nothing up to the end of
+  the run. A worker that waits for a slot gives up once no run is left or the run is stopped.
 * Mayas at once: on 8 cores / 16 threads 3 Mayas slow a scenario by 14%, 4 by 19%, 7 by 16-60%
   (Retarget_Master, 2026).
 """
@@ -305,9 +305,12 @@ class Pool:
         if self.queue.empty():
             return
         try:
-            started = session.start(self.params, visible=self.visible, temp=self.temp, slot_wait=self.slot_wait)
+            started = session.start(
+                self.params, visible=self.visible, temp=self.temp, slot_wait=self.slot_wait, slot_unneeded=self.done
+            )
         except (session.StartError, OSError) as error:
-            self.say(f"{name}: {error}", sys.stderr)
+            if not self.done():
+                self.say(f"{name}: {error}", sys.stderr)
             return
         with self.lock:
             self.sessions[number] = started
@@ -315,7 +318,7 @@ class Pool:
             self.say(f"{name} pid {started.pid}: started", self.out)
             # The queue may have emptied, or the run been stopped, while this Maya started: no wait
             # for a Maya with nothing to run, nor for one the harness is past closing.
-            if self.queue.empty() or self.stop.is_set():
+            if self.done():
                 return
             begin = time.monotonic()
             try:
@@ -354,6 +357,10 @@ class Pool:
                 return
             outcome = Outcome(time.monotonic() - start, *verdict(run.expected, failures), number + 1)
             self.finish(index, name, outcome, output)
+
+    def done(self) -> bool:
+        """No run is left to take, or the run was stopped: a Maya would have nothing to do."""
+        return self.queue.empty() or self.stop.is_set()
 
     def say(self, line: str, out: TextIO) -> None:
         """A line of progress; under the lock, so that it does not get into a report of another worker."""

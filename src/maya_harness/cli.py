@@ -20,7 +20,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from . import config, process, session, transport
+from . import config, process, session, slots, transport
 from . import run as scenario_run
 from .session import Record
 
@@ -29,6 +29,21 @@ DEFAULT_TTL = 60  # minutes
 PATCH_VARIABLE = "MAYA_HARNESS_DCC_MCP_PATCH"
 
 OK, FAILED, NOT_RUN = 0, 1, 2
+
+
+def seconds(text: str) -> float:
+    value = float(text)
+    if not value >= 0:  # nan too: a wait of nan seconds never ends
+        raise argparse.ArgumentTypeError(f"{text}: takes 0 or more seconds")
+    return value
+
+
+# Not --timeout: that would read as the time of a call.
+SLOT_WAIT: dict[str, Any] = {
+    "type": seconds,
+    "metavar": "SEC",
+    "help": "wait this long for a free Maya slot of this machine; without a limit by default",
+}
 
 
 class NotRun(Exception):
@@ -52,6 +67,7 @@ def parser() -> argparse.ArgumentParser:
         metavar="MIN",
         help=f"Maya quits after this many idle minutes, {DEFAULT_TTL} by default; 0 for never",
     )
+    start.add_argument("--slot-wait", **SLOT_WAIT)
 
     stop = commands.add_parser("stop", help="kill a Maya; by default the latest one of this project")
     which = stop.add_mutually_exclusive_group()
@@ -84,6 +100,7 @@ def parser() -> argparse.ArgumentParser:
     )
     scenarios.add_argument("--url", help="run in this Maya, which `start` left running")
     scenarios.add_argument("--visible", action="store_true", help="start the Maya on the usual desktop")
+    scenarios.add_argument("--slot-wait", **SLOT_WAIT)
     scenarios.add_argument("--json", action="store_true", help="the summary as one JSON line; the reports go to stderr")
 
     commands.add_parser("doctor", help="check Maya, the dcc-mcp module and its patch")
@@ -100,6 +117,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (
         NotRun,
         session.StartError,
+        slots.NoSlot,
         config.ConfigError,
         scenario_run.Refused,
         transport.TransportError,
@@ -121,7 +139,9 @@ def start(args: argparse.Namespace) -> int:
     if args.ttl < 0:
         raise NotRun("--ttl takes 0 or more minutes")
     params = project.params()
-    with session.start(params, visible=args.visible, ttl=args.ttl, record=True, temp=temp_dir()) as running:
+    with session.start(
+        params, visible=args.visible, ttl=args.ttl, record=True, temp=temp_dir(), slot_wait=args.slot_wait
+    ) as running:
         running.wait(transport.STARTUP_TIMEOUT)
         running.release()
     print(f"Maya {running.pid} of {project.project} is running at {running.url}")
@@ -205,7 +225,7 @@ def run_scenarios(args: argparse.Namespace) -> int:
         outcomes = scenario_run.run_at_url(args.url, work, runs, codes, out)
     else:
         count = 1 if args.visible else max(1, min(args.jobs, len(runs)))
-        pool = scenario_run.run_in_pool(project, runs, codes, count, args.visible, temp_dir(), out)
+        pool = scenario_run.run_in_pool(project, runs, codes, count, args.visible, temp_dir(), out, args.slot_wait)
         if not pool.ready:
             raise NotRun("no Maya started; see the errors above")
         outcomes = pool.outcomes
@@ -274,12 +294,15 @@ def status(args: argparse.Namespace) -> int:
         return OK
     if not rows:
         print("no running Maya of maya_harness")
-        return OK
     for row in rows:
         print(
             f"{row['project']:<20} pid {row['pid']:<6} {row['url']:<28} "
             f"age {row['age'] // 60} min, idle {row['idle'] // 60} min, ttl {row['ttl']} min  {row['project_root']}"
         )
+    taken = slots.holders()
+    print(f"Maya slots: {len(taken)} of {slots.count()} taken")
+    for holder in taken:
+        print(f"  {holder.line(now)}")
     return OK
 
 

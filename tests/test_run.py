@@ -2,6 +2,8 @@
 
 import io
 import itertools
+import json
+import subprocess
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -362,3 +364,124 @@ def test_load_runs_refuses_a_run_that_is_not_a_table(tmp_path: Path) -> None:
     table.write_text('run = ["check_fps"]\n', encoding="utf-8")
     with pytest.raises(scenario_run.Refused, match=r"a run is a \[\[run\]\] table"):
         scenario_run.load_runs(table)
+
+
+def test_run_json_with_every_slot_taken_keeps_stdout_one_json_line(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], project: Path, installed: None
+) -> None:
+    from maya_harness import slots
+
+    monkeypatch.setenv(slots.VARIABLE, "1")
+    now = [0.0]
+    monkeypatch.setattr(slots, "clock", lambda: now[0])
+    monkeypatch.setattr(slots, "pause", lambda seconds: now.__setitem__(0, now[0] + seconds))
+    held = slots.take(0)
+    try:
+        assert cli.main(["run", "check_fps", "--json", "--slot-wait", "5"]) == cli.NOT_RUN
+    finally:
+        held.release()
+    out, err = capsys.readouterr()
+    assert len(out.splitlines()) == 1 and json.loads(out)["success"] is False
+    assert "all 1 Maya slots are taken, waiting for one:" in err
+    assert "maya1: all 1 Maya slots stayed taken for 5 s" in err
+
+
+GIVE = session.process.give  # the real one: `installed` replaces it
+PROCESS_ALL_ACCESS = 0x1FFFFF
+
+
+def test_run_ends_once_no_run_is_left_though_a_maya_still_waits_for_a_slot(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    project: Path,
+    installed: None,
+    stub: Callable[..., "subprocess.Popen[str]"],
+) -> None:
+    """Two slots, one held by another agent; `--jobs 2`: maya1 takes the other slot and both runs,
+    maya2 waits. The slot maya1 frees goes to another harness first: maya2 must give up, not wait."""
+    from maya_harness import slots
+
+    monkeypatch.setenv(slots.VARIABLE, "2")
+    monkeypatch.setattr(session.process, "give", GIVE)  # stubs are real processes: they hold the slot
+    outside = [slots.take(0)]
+    grabbed = threading.Event()
+
+    class Maya:
+        def __init__(self, exe: Path, env: dict[str, str], visible: bool, number: int) -> None:
+            self.child = stub("import sys; sys.stdin.readline()", stdin=subprocess.PIPE)
+            self.pid = self.child.pid
+            self.created = 0
+            self.handle = session.process.kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, self.pid)
+
+        def running(self) -> bool:
+            return self.child.poll() is None
+
+        def close(self) -> None:
+            if self.child.poll() is None:
+                self.child.kill()
+                self.child.wait(5)
+                session.process.kernel32.CloseHandle(self.handle)
+                if not grabbed.is_set():  # another harness takes the freed slot
+                    taken = slots.try_take()
+                    assert taken is not None
+                    outside.append(taken)
+                    grabbed.set()
+
+        def window_titles(self) -> list[str]:
+            return []
+
+    def pause(seconds: float) -> None:  # the waiter polls again only once the slot is gone
+        grabbed.wait(5)
+
+    monkeypatch.setattr(session.process, "MayaProcess", Maya)
+    monkeypatch.setattr(session.transport, "wait_for_server", lambda *_: None)
+    monkeypatch.setattr(session.transport, "connect", lambda *_: None)
+    monkeypatch.setattr(session.transport, "server_logs", lambda pid: [])
+    monkeypatch.setattr(scenario_run, "run_scenario", lambda *_: ([], ""))
+    monkeypatch.setattr(slots, "pause", pause)
+    code: list[int] = []
+    runner = threading.Thread(
+        target=lambda: code.append(cli.main(["run", "check_fps", "check_bake", "--jobs", "2"])), daemon=True
+    )
+    runner.start()
+    runner.join(5)
+    hung = runner.is_alive()
+    for slot in outside:  # let a hung run end
+        slot.release()
+    runner.join(5)
+    out, err = capsys.readouterr()
+    assert not hung, "run still running after its runs"
+    assert code == [cli.OK]
+    assert out.count(" ok ") == 2
+    assert "no longer needed" not in err
+
+
+def test_a_stopped_pool_stops_waiting_for_a_slot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ctrl+C in a library runner: a worker that waits for a slot must not wait on."""
+    from maya_harness import slots
+
+    monkeypatch.setenv(slots.VARIABLE, "1")
+    held = slots.take(0)
+    pool = scenario_run.Pool(
+        [Run("check_0", {}, "")], [""], 1, session.SessionParams("p", Path("C:/p")), False, Path("C:/t"), io.StringIO()
+    )
+
+    def fake_start(
+        *_: object, slot_wait: float | None = None, slot_unneeded: Callable[[], bool] | None = None, **__: object
+    ) -> None:
+        try:
+            slots.take(slot_wait, unneeded=slot_unneeded)
+        except slots.NoSlot as error:
+            raise session.StartError(str(error)) from error
+        pytest.fail("got a slot")
+
+    monkeypatch.setattr(scenario_run.session, "start", fake_start)
+    monkeypatch.setattr(slots, "pause", lambda seconds: pool.stop.set())  # the stop comes while it waits
+    worker = threading.Thread(target=pool.work, args=(0,), daemon=True)
+    worker.start()
+    worker.join(5)
+    stuck = worker.is_alive()
+    held.release()
+    worker.join(5)
+    assert not stuck
+    assert pool.sessions == {}

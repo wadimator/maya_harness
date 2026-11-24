@@ -1,3 +1,4 @@
+import json
 import time
 from pathlib import Path
 
@@ -216,3 +217,30 @@ def test_exec_prints_the_error_only_without_a_traceback(
     monkeypatch.setattr(transport, "execute", lambda url, code, timeout: result)
     assert cli.main(["exec", "-c", "x"]) == cli.FAILED
     assert capsys.readouterr().err == printed
+
+
+def test_status_shows_the_slots_in_text_only(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from maya_harness import slots
+
+    monkeypatch.setattr(session, "sessions", lambda temp: [])
+    held = slots.take(0)
+    try:
+        assert cli.main(["status"]) == cli.OK
+        out = capsys.readouterr().out
+        assert "Maya slots: 1 of 4 taken\n  slot 1: a Maya starting\n" in out
+        assert cli.main(["status", "--json"]) == cli.OK
+        assert json.loads(capsys.readouterr().out) == []
+    finally:
+        held.release()
+
+
+@pytest.mark.parametrize("value", ["-5", "nan"])
+@pytest.mark.parametrize("command", [["start"], ["run", "check_fps"]])
+def test_a_slot_wait_below_0_is_refused(capsys: pytest.CaptureFixture[str], command: list[str], value: str) -> None:
+    with pytest.raises(SystemExit) as stopped:
+        cli.parser().parse_args([*command, f"--slot-wait={value}"])
+    assert stopped.value.code == cli.NOT_RUN
+    assert "takes 0 or more seconds" in capsys.readouterr().err
+    assert cli.parser().parse_args([*command, "--slot-wait", "0"]).slot_wait == 0
