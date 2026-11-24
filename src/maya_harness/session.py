@@ -35,9 +35,10 @@
   `userPrefs.mel` written in advance does not do it: Maya's first start in a new settings
   directory ignores it and writes its own.
 * As a library: `start` makes the directory and starts Maya, `Session.wait` waits for its
-  server. `start` does not wait, so a pool starts all its Mayas at once and waits for each in a
-  worker of its own. `Session.close` kills Maya and removes the directory; `Session.release`
-  leaves both, for a Maya that outlives this process (`maya-harness start`).
+  server. `start` does not wait: a worker of a pool that finds nothing left to run once its Maya
+  has started closes it without waiting for the server. `Session.close` kills Maya and removes
+  the directory; `Session.release` leaves both, for a Maya that outlives this process
+  (`maya-harness start`).
 """
 
 from __future__ import annotations

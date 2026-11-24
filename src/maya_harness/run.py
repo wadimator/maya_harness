@@ -16,18 +16,21 @@
   seconds = 51             # measured; `all` runs the longest first, so the Mayas end close together
   ```
 
-* The pool: up to `--jobs` Mayas, each a session of its own in the job of this process; each
-  takes the next run from one queue. A Maya that crashes or times out fails its run and leaves;
-  the others take the rest. Ctrl+C lets no Maya take another run. The Mayas are killed and their
-  session directories removed at the end; a session writes no `state.json`, so `exec` and `stop`
-  never pick a Maya of a run.
+* The pool: up to `--jobs` worker threads; each, while runs are left, starts a Maya of its own (a
+  session in the job of this process), waits for it and takes the next run from one queue. A
+  Maya leaves as soon as the queue is empty, or when it crashes or times out: it fails its run,
+  and the others take the rest. Ctrl+C lets no Maya take another run. A Maya that leaves is
+  killed and its session directory removed at once, any left at the end too; a session writes no
+  `state.json`, so `exec` and `stop` never pick a Maya of a run.
+* Each Maya is started and waited for in its own worker, not all started first and closed at
+  the end: a worker that cannot start its Maya yet holds up no other, and a Maya with nothing
+  left to run holds nothing up to the end of the run.
 * Mayas at once: on 8 cores / 16 threads 3 Mayas slow a scenario by 14%, 4 by 19%, 7 by 16-60%
   (Retarget_Master, 2026).
 """
 
 from __future__ import annotations
 
-import contextlib
 import json
 import queue
 import sys
@@ -240,15 +243,28 @@ def run_at_url(url: str, work: Path, runs: list[Run], codes: list[str], out: Tex
 
 
 class Pool:
-    """Mayas of this run, each driven by a worker thread that takes runs from one queue in their order.
+    """`count` worker threads; each starts a Maya of its own while runs are left, waits for it and takes
+    runs from one queue in their order.
 
-    A Maya that crashes or times out fails its run and leaves; the others take the rest of the queue. A stop
-    (Ctrl+C) lets no worker take another run."""
+    A Maya leaves as soon as the queue is empty, or when it crashes or times out: it fails its run, and the
+    others take the rest of the queue. A stop (Ctrl+C) lets no worker take another run."""
 
-    def __init__(self, runs: list[Run], codes: list[str], slots: list[session.Session], out: TextIO) -> None:
+    def __init__(
+        self,
+        runs: list[Run],
+        codes: list[str],
+        count: int,
+        params: session.SessionParams,
+        visible: bool,
+        temp: Path,
+        out: TextIO,
+    ) -> None:
         self.runs = runs
         self.codes = codes
-        self.slots = slots
+        self.count = count
+        self.params = params
+        self.visible = visible
+        self.temp = temp
         self.out = out
         self.queue: queue.Queue[int] = queue.Queue()
         for index in range(len(runs)):
@@ -256,10 +272,12 @@ class Pool:
         self.outcomes: dict[int, Outcome] = {}
         self.stop = threading.Event()
         self.lock = threading.Lock()
-        self.ready: set[int] = set()  # the indexes of the Mayas that started and connected
+        # By the number of the worker: the workers start their Mayas in any order.
+        self.sessions: dict[int, session.Session] = {}
+        self.ready: set[int] = set()  # the numbers of the workers whose Maya started and connected
 
     def run(self) -> bool:
-        workers = [threading.Thread(target=self.work, args=(number,), daemon=True) for number in range(len(self.slots))]
+        workers = [threading.Thread(target=self.work, args=(number,), daemon=True) for number in range(self.count)]
         for worker in workers:
             worker.start()
         try:
@@ -269,9 +287,10 @@ class Pool:
                     worker.join(0.2)
         except KeyboardInterrupt:
             self.stop.set()
-            for slot in self.slots:
-                titles = slot.maya.window_titles()
-                print(f"KeyboardInterrupt: the windows of Maya {slot.maya.pid}: {titles}", file=sys.stderr)
+            with self.lock:
+                for started in self.sessions.values():
+                    titles = started.maya.window_titles()
+                    print(f"KeyboardInterrupt: the windows of Maya {started.pid}: {titles}", file=sys.stderr)
             raise
         finally:
             with self.lock:
@@ -279,39 +298,64 @@ class Pool:
         return result
 
     def work(self, number: int) -> None:
-        slot = self.slots[number]
-        maya = slot.maya
         name = f"maya{number + 1}"
-        try:
-            slot.wait(transport.STARTUP_TIMEOUT)
-        except session.StartError as error:
-            if not self.stop.is_set():
-                with self.lock:
-                    print(f"{name}: {error}", file=sys.stderr, flush=True)
-            maya.close()
+        if self.queue.empty():
             return
-        self.ready.add(number)
+        try:
+            started = session.start(self.params, visible=self.visible, temp=self.temp)
+        except (session.StartError, OSError) as error:
+            self.say(f"{name}: {error}", sys.stderr)
+            return
+        with self.lock:
+            self.sessions[number] = started
+        try:
+            self.say(f"{name} pid {started.pid}: started", self.out)
+            # The queue may have emptied, or the run been stopped, while this Maya started: no wait
+            # for a Maya with nothing to run, nor for one the harness is past closing.
+            if self.queue.empty() or self.stop.is_set():
+                return
+            begin = time.monotonic()
+            try:
+                started.wait(transport.STARTUP_TIMEOUT)
+            except session.StartError as error:
+                if not self.stop.is_set():
+                    self.say(f"{name}: {error}", sys.stderr)
+                return
+            with self.lock:
+                self.ready.add(number)
+            self.say(f"{name}: ready in {time.monotonic() - begin:.0f} s", self.out)
+            self.take_runs(number, name, started)
+        finally:
+            started.close()  # at once: a Maya that leaves holds nothing up to the end of the run
+
+    def take_runs(self, number: int, name: str, started: session.Session) -> None:
         while not self.stop.is_set():
             try:
                 index = self.queue.get_nowait()
             except queue.Empty:
                 return
             run = self.runs[index]
+            self.say(f"{name}: {label_of(run)}", self.out)
             start = time.monotonic()
             try:
-                failures, output = run_scenario(slot.url, self.codes[index])
+                failures, output = run_scenario(started.url, self.codes[index])
             except (OSError, transport.TransportError) as error:  # Maya crashed, or the scenario timed out
                 if self.stop.is_set():  # the harness closed it: the summary is out already, the run is «not run»
                     return
+                logs = [str(log) for log in transport.server_logs(started.pid)]
                 text = (
-                    f"FAIL: Maya {maya.pid} lost — {type(error).__name__}: {error}; its windows "
-                    f"{maya.window_titles()}; its logs {[str(log) for log in transport.server_logs(maya.pid)]}"
+                    f"FAIL: Maya {started.pid} lost — {type(error).__name__}: {error}; its windows "
+                    f"{started.maya.window_titles()}; its logs {logs}"
                 )
                 self.finish(index, name, Outcome(time.monotonic() - start, False, text, number + 1), "")
-                maya.close()
                 return
             outcome = Outcome(time.monotonic() - start, *verdict(run.expected, failures), number + 1)
             self.finish(index, name, outcome, output)
+
+    def say(self, line: str, out: TextIO) -> None:
+        """A line of progress; under the lock, so that it does not get into a report of another worker."""
+        with self.lock:
+            print(line, file=out, flush=True)
 
     def finish(self, index: int, name: str, outcome: Outcome, output: str) -> None:
         """The run's report in one piece and a line of progress."""
@@ -337,17 +381,18 @@ def run_in_pool(
     temp: Path,
     out: TextIO,
 ) -> Pool:
-    """Starts `count` Mayas, runs `runs` in them and closes them."""
-    slots: list[session.Session] = []
-    pool = Pool(runs, codes, slots, out)
-    with contextlib.ExitStack() as stack:  # every Maya starts before any is waited for
-        for _ in range(count):
-            started = session.start(project.params(), visible=visible, temp=temp)
-            slots.append(stack.enter_context(started))
+    """Runs `runs` in up to `count` Mayas; each is closed when it leaves, any left at the end too."""
+    pool = Pool(runs, codes, count, project.params(), visible, temp, out)
+    try:
         pool.run()
+    finally:  # Ctrl+C, an error: the workers are daemons and may still hold their Mayas
+        with pool.lock:
+            left = list(pool.sessions.values())
+        for started in left:
+            started.close()
     failed = {outcome.maya for outcome in pool.outcomes.values() if not outcome.ok}
-    for number, slot in enumerate(slots, start=1):  # the log of a Maya whose run failed stays
-        if number not in failed and number - 1 in pool.ready:
-            for log in transport.server_logs(slot.pid):
+    for number, started in pool.sessions.items():  # the log of a Maya whose run failed stays
+        if number + 1 not in failed and number in pool.ready:
+            for log in transport.server_logs(started.pid):
                 log.unlink(missing_ok=True)
     return pool

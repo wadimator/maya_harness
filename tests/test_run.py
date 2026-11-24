@@ -1,5 +1,9 @@
 """What `run` runs and whether a run passed; the Mayas themselves are checked by running it."""
 
+import io
+import itertools
+import threading
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -193,16 +197,14 @@ def test_run_removes_the_session_of_a_maya_that_failed_to_start(
     assert list((tmp_path / "temp").iterdir()) == []
 
 
-def test_the_pool_starts_every_maya_before_it_waits_for_any(
+def test_the_pool_starts_each_maya_on_a_desktop_of_its_own(
     monkeypatch: pytest.MonkeyPatch, project: Path, tmp_path: Path, installed: None
 ) -> None:
-    events: list[str] = []
     desktops: set[int] = set()
 
     class Maya:
         def __init__(self, exe: Path, env: dict[str, str], visible: bool, number: int) -> None:
             self.pid = number
-            events.append("start")
             desktops.add(number)
 
         def running(self) -> bool:
@@ -214,16 +216,115 @@ def test_the_pool_starts_every_maya_before_it_waits_for_any(
             return []
 
     def wait_for_server(*_: object) -> None:
-        events.append("wait")
         raise TimeoutError("no server")
 
     monkeypatch.setattr(session.process, "MayaProcess", Maya)
     monkeypatch.setattr(session.transport, "wait_for_server", wait_for_server)
     monkeypatch.setattr(session.transport, "server_logs", lambda pid: [])  # the fake pids are not its Mayas
     assert cli.main(["run", "all", "--jobs", "3"]) == cli.NOT_RUN
-    assert events == ["start", "start", "start", "wait", "wait", "wait"]
     assert len(desktops) == 3
     assert list((tmp_path / "temp").iterdir()) == []
+
+
+class FakeSession:
+    """A session of the pool without Maya: what the pool did with it."""
+
+    def __init__(self, pid: int, closed: threading.Event) -> None:
+        self.pid = pid
+        self.url = f"http://127.0.0.1:{pid}/mcp"
+        self.waited = False
+        self.closed = False
+        self.any_closed = closed
+
+    def wait(self, timeout: float) -> None:
+        self.waited = True
+
+    def close(self) -> None:
+        self.closed = True
+        self.any_closed.set()
+
+
+def fake_pool(
+    monkeypatch: pytest.MonkeyPatch, runs: int, count: int, start: Callable[[], None] = lambda: None
+) -> tuple[scenario_run.Pool, list[FakeSession], io.StringIO]:
+    """A pool of `count` workers and `runs` runs; `start` runs inside each `session.start`."""
+    out = io.StringIO()
+    pool = scenario_run.Pool(
+        [Run(f"check_{index}", {}, "") for index in range(runs)],
+        [""] * runs,
+        count,
+        session.SessionParams("p", Path("C:/p")),
+        False,
+        Path("C:/temp"),
+        out,
+    )
+    started: list[FakeSession] = []
+    closed = threading.Event()
+
+    def fake_start(*_: object, **__: object) -> FakeSession:
+        start()
+        with pool.lock:
+            started.append(FakeSession(len(started) + 1, closed))
+            return started[-1]
+
+    monkeypatch.setattr(scenario_run.session, "start", fake_start)
+    return pool, started, out
+
+
+def test_a_maya_with_nothing_left_to_run_leaves_before_the_others_end(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The run of one Maya ends only once the other Maya, with nothing left to run, is closed."""
+    pool, started, out = fake_pool(monkeypatch, runs=2, count=2)
+    calls: list[bool] = []
+
+    def run_scenario(url: str, code: str) -> tuple[list[str], str]:
+        with pool.lock:
+            first = not calls
+            calls.append(True)
+        if first:
+            calls.append(started[0].any_closed.wait(5))
+        return [], ""
+
+    monkeypatch.setattr(scenario_run, "run_scenario", run_scenario)
+    assert pool.run()
+    assert calls == [True, True, True]  # the first run saw a Maya closed before it ended
+    assert all(item.waited and item.closed for item in started)
+    text = out.getvalue()
+    assert "maya1 pid" in text and ": started" in text and ": ready in" in text and ": check_0" in text
+
+
+def test_a_maya_started_when_the_queue_is_empty_is_closed_without_a_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both workers find the run in the queue; the second Maya is up only after the first took it."""
+    second_in, taken = threading.Event(), threading.Event()
+    calls = itertools.count()
+
+    def start() -> None:
+        if next(calls) == 0:
+            second_in.wait(5)
+        else:
+            second_in.set()
+            taken.wait(5)
+
+    pool, started, _ = fake_pool(monkeypatch, runs=1, count=2, start=start)
+
+    def run_scenario(url: str, code: str) -> tuple[list[str], str]:
+        taken.set()
+        return [], ""
+
+    monkeypatch.setattr(scenario_run, "run_scenario", run_scenario)
+    assert pool.run()
+    first, second = started
+    assert first.waited and first.closed
+    assert not second.waited and second.closed
+
+
+def test_a_maya_started_after_a_stop_is_closed_without_a_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ctrl+C while a Maya starts: it must not be waited for past the harness closing the others."""
+    pool, started, _ = fake_pool(monkeypatch, runs=1, count=1, start=lambda: pool.stop.set())
+    monkeypatch.setattr(scenario_run, "run_scenario", lambda *_: pytest.fail("a run after the stop"))
+    assert not pool.run()
+    (only,) = started
+    assert not only.waited and only.closed
+    assert pool.outcomes == {}
 
 
 @pytest.mark.parametrize("output", ['{"x": 1}', "null", '{"failures": "load"}', '{"failures": [1]}'])
