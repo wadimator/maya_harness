@@ -45,6 +45,9 @@ JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
 BELOW_NORMAL_PRIORITY_CLASS = 0x4000
 JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9
 DUPLICATE_SAME_ACCESS = 0x2
+DESKTOP_READOBJECTS = 0x1
+DESKTOP_ENUMERATE = 0x40
+DESKTOP_PREFIX = "maya_harness_"
 
 
 class STARTUPINFOW(ctypes.Structure):
@@ -144,6 +147,11 @@ user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintyp
 user32.IsWindowVisible.argtypes = [wintypes.HWND]
 user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
 user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+DESKENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.LPWSTR, wintypes.LPARAM)
+user32.GetProcessWindowStation.restype = wintypes.HANDLE
+user32.EnumDesktopsW.argtypes = [wintypes.HANDLE, DESKENUMPROC, wintypes.LPARAM]
+user32.OpenDesktopW.restype = wintypes.HANDLE
+user32.OpenDesktopW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 kernel32.OpenProcess.restype = wintypes.HANDLE
 kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
@@ -202,7 +210,7 @@ class MayaProcess:
         startup = STARTUPINFOW(cb=ctypes.sizeof(STARTUPINFOW))
         self.desktop = None
         if not visible:
-            name = f"maya_harness_{os.getpid()}_{number}"
+            name = f"{DESKTOP_PREFIX}{os.getpid()}_{number}"
             self.desktop = _checked(user32.CreateDesktopW(name, None, None, 0, GENERIC_ALL, None))
             startup.lpDesktop = f"WinSta0\\{name}"
         self.job = _checked(kernel32.CreateJobObjectW(None, None))
@@ -247,20 +255,7 @@ class MayaProcess:
 
     def window_titles(self) -> list[str]:
         """Maya's visible windows: on the hidden desktop a modal dialog is seen only this way."""
-        titles: list[str] = []
-
-        def collect(window: int, _: int) -> bool:
-            owner = wintypes.DWORD()
-            user32.GetWindowThreadProcessId(window, ctypes.byref(owner))
-            if owner.value == self.pid and user32.IsWindowVisible(window) and user32.GetWindowTextLengthW(window):
-                title = ctypes.create_unicode_buffer(512)
-                user32.GetWindowTextW(window, title, len(title))
-                titles.append(title.value)
-            return True
-
-        desktop = self.desktop or user32.GetThreadDesktop(kernel32.GetCurrentThreadId())
-        user32.EnumDesktopWindows(desktop, WNDENUMPROC(collect), 0)
-        return titles
+        return window_titles(self.pid, self.desktop or user32.GetThreadDesktop(kernel32.GetCurrentThreadId()))
 
     def close(self) -> None:
         """Kills whatever is still running in the job, then lets go of the desktop. Once."""
@@ -288,6 +283,45 @@ class MayaProcess:
         kernel32.CloseHandle(self.handle)
         if self.desktop:
             user32.CloseDesktop(self.desktop)
+
+
+def window_titles(pid: int, desktop: object = None) -> list[str]:
+    """The visible windows of process `pid` that have a title (Maya has visible ones without),
+    on `desktop`; without it, on every hidden desktop of maya_harness and on the current one:
+    the Maya of another harness process is on a desktop this one did not make."""
+    if desktop is not None:
+        return _titles_on(desktop, pid)
+    names: list[str] = []
+
+    def collect(name: str, _: int) -> bool:
+        if name.startswith(DESKTOP_PREFIX):
+            names.append(name)
+        return True
+
+    user32.EnumDesktopsW(user32.GetProcessWindowStation(), DESKENUMPROC(collect), 0)
+    titles = _titles_on(user32.GetThreadDesktop(kernel32.GetCurrentThreadId()), pid)
+    for name in names:
+        handle = user32.OpenDesktopW(name, 0, False, DESKTOP_READOBJECTS | DESKTOP_ENUMERATE)
+        if handle:  # closed since it was listed
+            titles += _titles_on(handle, pid)
+            user32.CloseDesktop(handle)
+    return titles
+
+
+def _titles_on(desktop: object, pid: int) -> list[str]:
+    titles: list[str] = []
+
+    def collect(window: int, _: int) -> bool:
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(window, ctypes.byref(owner))
+        if owner.value == pid and user32.IsWindowVisible(window) and user32.GetWindowTextLengthW(window):
+            title = ctypes.create_unicode_buffer(512)
+            user32.GetWindowTextW(window, title, len(title))
+            titles.append(title.value)
+        return True
+
+    user32.EnumDesktopWindows(desktop, WNDENUMPROC(collect), 0)
+    return titles
 
 
 def give(handle: object, owner: object) -> None:

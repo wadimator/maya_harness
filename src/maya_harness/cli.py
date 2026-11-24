@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -24,7 +25,6 @@ from . import run as scenario_run
 from .session import Record
 
 CALL_TIMEOUT = 900  # seconds per `exec`
-QUIT_TIMEOUT = 60  # seconds for a quitting Maya to exit
 DEFAULT_TTL = 60  # minutes
 PATCH_VARIABLE = "MAYA_HARNESS_DCC_MCP_PATCH"
 
@@ -53,7 +53,7 @@ def parser() -> argparse.ArgumentParser:
         help=f"Maya quits after this many idle minutes, {DEFAULT_TTL} by default; 0 for never",
     )
 
-    stop = commands.add_parser("stop", help="quit a Maya; by default the latest one of this project")
+    stop = commands.add_parser("stop", help="kill a Maya; by default the latest one of this project")
     which = stop.add_mutually_exclusive_group()
     which.add_argument("url", nargs="?", help="the Maya at this address")
     which.add_argument("--project", action="store_true", help="every Maya of this project")
@@ -229,24 +229,22 @@ def stop(args: argparse.Namespace) -> int:
     if not targets:
         print("no running Maya to stop")
         return OK
-    unreachable = []
+    # A kill, not a `quit`: a busy Maya takes a quit only after its current call, one on a modal
+    # dialog never; the session is thrown away, so a quit has nothing to save. What Maya shows
+    # is printed first: a dialog on the hidden desktop is seen only this way.
+    running = False
+    now = time.time()
     for item in targets:
-        try:
-            transport.connect(item.state.url, QUIT_TIMEOUT, item.work)
-            transport.execute(item.state.url, transport.QUIT_CODE, QUIT_TIMEOUT)
-        except (transport.TransportError, OSError) as error:  # a modal dialog, a Maya gone
-            print(f"Maya {item.state.maya_pid} at {item.state.url} did not take quit: {error}", file=sys.stderr)
-            unreachable.append(item)
-    deadline = time.monotonic() + QUIT_TIMEOUT
-    left = [item for item in targets if item not in unreachable]
-    while left and time.monotonic() < deadline:
-        left = [item for item in left if process.process_alive(item.state.maya_pid)]
-        time.sleep(0.25)
-    killed = [item for item in left + unreachable if process.kill_maya(item.state.maya_pid, item.state.maya_created)]
-    running = [item for item in left + unreachable if item not in killed]
-    for item in targets:
-        outcome = "still running" if item in running else "killed" if item in killed else "closed"
-        print(f"Maya {item.state.maya_pid} at {item.state.url}: {outcome}")
+        pid = item.state.maya_pid
+        titles = ", ".join(process.window_titles(pid))
+        idle = describe(item, now)["idle"] // 60
+        print(f"Maya {pid} {item.state.url} {item.state.project}: idle {idle} min, windows [{titles}]", flush=True)
+        if process.kill_maya(pid, item.state.maya_created):
+            shutil.rmtree(item.root, ignore_errors=True)
+            print(f"Maya {pid}: killed")
+        else:  # the directory stays: its logs tell why
+            running = True
+            print(f"Maya {pid}: still running")
     return FAILED if running else OK
 
 

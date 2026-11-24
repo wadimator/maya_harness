@@ -1,3 +1,4 @@
+import time
 from pathlib import Path
 
 import pytest
@@ -135,28 +136,33 @@ def test_exec_with_an_unreadable_reply_exits_1_and_at_connect_2(
     assert cli.main(["exec", "-c", "1"]) == cli.FAILED
 
 
-def test_stop_goes_on_past_a_maya_that_does_not_answer(monkeypatch: pytest.MonkeyPatch) -> None:
-    from maya_harness import process, transport
+def test_stop_kills_at_once_and_keeps_the_directory_of_a_maya_still_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No call goes to Maya: a busy one would take it only after its current call."""
+    from maya_harness import process
 
-    hung, other = make("C:/p", 1), make("C:/p", 2)
-    quit_sent: list[str] = []
+    def target(pid: int) -> Record:
+        root = tmp_path / f"maya_harness_{pid}"
+        root.mkdir()
+        return Record(root, State("p", "C:/p", 1, pid, f"http://127.0.0.1:{pid}/mcp", time.time(), maya_created=pid))
 
-    def connect(url: str, timeout: float, work: Path | None = None) -> Path:
-        if url == hung.state.url:
-            raise TimeoutError("timed out")
-        return Path(".")
+    def no_call(*args: object) -> None:
+        raise AssertionError("stop called Maya")
 
-    def execute(url: str, code: str, timeout: float) -> transport.Result:
-        quit_sent.append(url)
-        return transport.Result(True)
-
-    monkeypatch.setattr(session, "sessions", lambda temp: [hung, other])
-    monkeypatch.setattr(transport, "connect", connect)
-    monkeypatch.setattr(transport, "execute", execute)
-    monkeypatch.setattr(process, "process_alive", lambda pid: False)
-    monkeypatch.setattr(process, "kill_maya", lambda pid, created: False)
+    stuck, killed = target(10), target(20)
+    monkeypatch.setattr(session, "sessions", lambda temp: [stuck, killed])
+    monkeypatch.setattr(transport, "connect", no_call)
+    monkeypatch.setattr(transport, "execute", no_call)
+    monkeypatch.setattr(process, "window_titles", lambda pid: ["Maya-2025"])
+    monkeypatch.setattr(process, "kill_maya", lambda pid, created: pid == killed.state.maya_pid)
     assert cli.main(["stop", "--all-mine"]) == cli.FAILED
-    assert quit_sent == [other.state.url]
+    assert stuck.root.is_dir()
+    assert not killed.root.exists()
+    out = capsys.readouterr().out
+    assert "Maya 10 http://127.0.0.1:10/mcp p: idle 0 min, windows [Maya-2025]" in out
+    assert "Maya 10: still running" in out
+    assert "Maya 20: killed" in out
 
 
 def test_environment_passes_the_ttl() -> None:
