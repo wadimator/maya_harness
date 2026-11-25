@@ -6,3 +6,6 @@ __pycache__/
 .pytest_cache/
 dist/
 tasks/
+
+# Personal Claude Code settings
+.claude/settings.local.json
