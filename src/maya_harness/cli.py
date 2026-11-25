@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -22,9 +21,8 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from . import config, process, session, slots, transport
-from . import run as scenario_run
-from .session import Record
+from . import call, config, pool, process, registry, scenarios, session, slots, transport
+from .registry import Record
 
 CALL_TIMEOUT = 900  # seconds per `exec`, by default
 MAX_CALL_TIMEOUT = 86400  # a day: a longer wait is a typo, and past 2147483 s the socket overflows
@@ -108,20 +106,20 @@ def parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--json", action="store_true")
 
-    scenarios = commands.add_parser(
+    checks = commands.add_parser(
         "run", help="run check scenarios in Mayas of their own", epilog="See docs/scenarios.md."
     )
-    scenarios.add_argument("items", nargs="+", help="scenario names or all, and name=value parameters")
-    scenarios.add_argument(
+    checks.add_argument("items", nargs="+", help="scenario names or all, and name=value parameters")
+    checks.add_argument(
         "--jobs",
         type=int,
-        default=scenario_run.JOBS,
-        help=f"Mayas at once, {scenario_run.JOBS} by default; one with --visible",
+        default=pool.JOBS,
+        help=f"Mayas at once, {pool.JOBS} by default; one with --visible",
     )
-    scenarios.add_argument("--url", help="run in this Maya, which `start` left running")
-    scenarios.add_argument("--visible", action="store_true", help="start the Maya on the usual desktop")
-    scenarios.add_argument("--slot-wait", **SLOT_WAIT)
-    scenarios.add_argument("--json", action="store_true", help="the summary as one JSON line; the reports go to stderr")
+    checks.add_argument("--url", help="run in this Maya, which `start` left running")
+    checks.add_argument("--visible", action="store_true", help="start the Maya on the usual desktop")
+    checks.add_argument("--slot-wait", **SLOT_WAIT)
+    checks.add_argument("--json", action="store_true", help="the summary as one JSON line; the reports go to stderr")
 
     commands.add_parser("doctor", help="check Maya, the dcc-mcp module and its patch")
     return main
@@ -139,7 +137,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         session.StartError,
         slots.NoSlot,
         config.ConfigError,
-        scenario_run.Refused,
+        scenarios.Refused,
         transport.TransportError,
         TimeoutError,
         OSError,
@@ -160,39 +158,31 @@ def start(args: argparse.Namespace) -> int:
         raise NotRun("--ttl takes 0 or more minutes")
     params = project.params()
     with session.start(
-        params, visible=args.visible, ttl=args.ttl, record=True, temp=temp_dir(), slot_wait=args.slot_wait
+        params, visible=args.visible, ttl=args.ttl, command="start", temp=temp_dir(), slot_wait=args.slot_wait
     ) as running:
-        running.wait(transport.STARTUP_TIMEOUT)
+        running.wait()
         running.release()
     print(f"Maya {running.pid} of {project.project} is running at {running.url}")
     return OK
 
 
-def find_project_sessions(found: list[Record], root: Path) -> list[Record]:
-    """The sessions started from the project at `root`, the latest last. By the project root, not
-    the project name: a worktree has the same name, and its Maya has the other tree on sys.path."""
-    return [item for item in found if Path(item.state.project_root) == root]
-
-
 def select(url: str | None) -> tuple[str, Record | None]:
-    """The address to call: `url`, or the latest live session of the project here."""
-    found = session.sessions(temp_dir())
+    """The address to call: `url`, or the latest live session of the project here. The project's
+    config is read only without `url`: `exec <url>` runs from any directory."""
+    found = registry.running(temp_dir())
+    root = None if url else config.load(Path.cwd()).root
+    record = registry.select(found, url, root)
     if url:
-        return url, next((item for item in found if item.state.url == url), None)
-    root = config.load(Path.cwd()).root
-    mine = find_project_sessions(found, root)
-    if not mine:
+        return url, record
+    if record is None:
         raise NotRun(f"no running Maya of the project at {root}; `maya-harness start` first")
-    return mine[-1].state.url, mine[-1]
+    return record.state.url, record
 
 
 def reload_code(packages: Sequence[str]) -> str:
     """Drops `packages` and their submodules from `sys.modules`, so the code imports them from disk."""
     return (
-        "import sys as _maya_harness_sys\n"
-        "for _maya_harness_name in tuple(_maya_harness_sys.modules):\n"
-        f"    if _maya_harness_name.split('.')[0] in {tuple(packages)!r}:\n"
-        "        del _maya_harness_sys.modules[_maya_harness_name]\n"
+        f"from maya_harness import inmaya as _maya_harness_inmaya\n_maya_harness_inmaya.reload({tuple(packages)!r})\n"
     )
 
 
@@ -215,29 +205,23 @@ def heartbeat(pid: int, watch: transport.Watch) -> transport.Watch:
 
 def run(args: argparse.Namespace) -> int:
     code = args.code if args.code is not None else args.file.read_text(encoding="utf-8")
-    url, target = select(args.url)
+    url, record = select(args.url)
     packages = config.load(Path.cwd()).reload if args.reload else ()
     # Only a Maya of a session: the pid of a Maya at a foreign address is unknown.
-    watch = heartbeat(target.state.maya_pid, session.watcher(target.state.maya_pid, url)) if target else None
+    pid = record.state.maya_pid if record else None
+    watch = heartbeat(pid, call.watcher(pid, url)) if pid is not None else None
     # A connect cut short on a dialog is a TransportError out of `main`: the code was not sent.
-    work = transport.connect(url, args.timeout, target.work if target else None, watch)
-    session.touch(work)
-    slots.begin_call(work)
+    target = call.connect(url, args.timeout, work=record.work if record else None, pid=pid, watch=watch)
     try:
         # A call of its own, not a prefix of the code: `from __future__` must open the code, and
         # the line numbers of its traceback must be the file's.
-        result = (
-            transport.execute(url, reload_code(packages), args.timeout, watch) if packages else transport.Result(True)
-        )
+        result = target.execute(reload_code(packages), args.timeout, watch) if packages else transport.Result(True)
         if result.success:
-            result = transport.execute(url, code, args.timeout, watch)
+            result = target.execute(code, args.timeout, watch)
     except OSError as error:  # a timeout, a reset: the code reached Maya and may have run
         result = transport.Result(False, type(error).__name__, stderr=f"no reply from {url}: {error}")
     except transport.CallAborted as error:  # the code reached Maya and runs on after the dialog
         result = transport.Result(False, type(error).__name__, stderr=str(error))
-    finally:
-        slots.end_call(work)
-        session.touch(work)
     if args.json:
         fields = ("success", "error", "stdout", "stderr", "output")
         print(json.dumps({name: getattr(result, name) for name in fields} | {"url": url}, ensure_ascii=False))
@@ -258,42 +242,41 @@ def run_scenarios(args: argparse.Namespace) -> int:
     project = config.load(Path.cwd())
     if project.scenarios is None:
         raise NotRun(f"no [tool.maya_harness.scenarios] in the pyproject.toml of {project.root}")
-    runs = scenario_run.parse(args.items, scenario_run.load_runs(project.scenarios.runs))
-    scenario_run.refuse_unknown(runs, project.scenarios)
+    runs = scenarios.parse(args.items, scenarios.load_runs(project.scenarios.runs))
+    scenarios.refuse_unknown(runs, project.scenarios)
     if args.jobs < 1:
         raise NotRun("--jobs takes 1 or more")
-    if args.jobs > scenario_run.MAX_JOBS:
-        print(f"--jobs {args.jobs}: more than {scenario_run.MAX_JOBS} Mayas slow each other down.", file=sys.stderr)
-    codes = [scenario_run.code_of(item, project.scenarios.dir, project.reload) for item in runs]
+    if args.jobs > pool.MAX_JOBS:
+        print(f"--jobs {args.jobs}: more than {pool.MAX_JOBS} Mayas slow each other down.", file=sys.stderr)
+    codes = [scenarios.code_of(item, project.scenarios.dir, project.reload) for item in runs]
     out = sys.stderr if args.json else sys.stdout
     if args.url:
-        _, target = select(args.url)
-        watch = session.watcher(target.state.maya_pid, args.url) if target else None
-        work = transport.connect(args.url, CALL_TIMEOUT, None, watch)
-        outcomes = scenario_run.run_at_url(args.url, work, runs, codes, out, watch)
+        _, record = select(args.url)
+        target = call.connect(args.url, CALL_TIMEOUT, pid=record.state.maya_pid if record else None)
+        outcomes = pool.run_at(target, runs, codes, out)
     else:
         count = 1 if args.visible else max(1, min(args.jobs, len(runs)))
-        pool = scenario_run.run_in_pool(project, runs, codes, count, args.visible, temp_dir(), out, args.slot_wait)
-        if not pool.ready:
+        ran = pool.run_in_pool(project, runs, codes, count, args.visible, temp_dir(), out, args.slot_wait)
+        if not ran.ready:
             raise NotRun("no Maya started; see the errors above")
-        outcomes = pool.outcomes
+        outcomes = ran.outcomes
     if args.json:
-        print(json.dumps(scenario_run.summary(runs, outcomes), ensure_ascii=False))
-    return OK if scenario_run.passed(runs, outcomes) else FAILED
+        print(json.dumps(scenarios.summary(runs, outcomes), ensure_ascii=False))
+    return OK if scenarios.passed(runs, outcomes) else FAILED
 
 
 def stop(args: argparse.Namespace) -> int:
-    found = session.sessions(temp_dir())
+    found = registry.running(temp_dir())
     if args.all_mine:
         targets = found
     elif args.project:
-        targets = find_project_sessions(found, config.load(Path.cwd()).root)
+        targets = registry.of_project(found, config.load(Path.cwd()).root)
     elif args.url:
         targets = [item for item in found if item.state.url == args.url]
         if not targets:
             raise NotRun(f"no Maya of maya_harness at {args.url}")
     else:
-        targets = find_project_sessions(found, config.load(Path.cwd()).root)[-1:]
+        targets = registry.of_project(found, config.load(Path.cwd()).root)[-1:]
     if not targets:
         print("no running Maya to stop")
         return OK
@@ -304,39 +287,14 @@ def stop(args: argparse.Namespace) -> int:
     now = time.time()
     for item in targets:
         pid = item.state.maya_pid
-        row = describe(item, now)
+        row = registry.describe(item, now)
         print(f"Maya {pid} {item.state.url} {item.state.project}: {activity(row)}", flush=True)
-        if process.kill_maya(pid, item.state.maya_created):
-            shutil.rmtree(item.root, ignore_errors=True)
+        if registry.stop(item):
             print(f"Maya {pid}: killed")
         else:  # the directory stays: its logs tell why
             running = True
             print(f"Maya {pid}: still running")
     return FAILED if running else OK
-
-
-def describe(item: Record, now: float) -> dict[str, Any]:
-    """A session for `status` and `stop`: `busy` — the seconds of the running call, None when none
-    runs; `idle` — since the last call; `windows` — what Maya shows, a dialog on the hidden desktop
-    too."""
-    last_call = item.work / "last_call"
-    try:
-        idle_since = last_call.stat().st_mtime
-    except OSError:
-        idle_since = item.state.started
-    since = slots.in_call(item.work)
-    return {
-        "project": item.state.project,
-        "project_root": item.state.project_root,
-        "pid": item.state.maya_pid,
-        "url": item.state.url,
-        "age": round(now - item.state.started),
-        "idle": round(now - idle_since),
-        "busy": None if since is None else round(now - since),
-        "ttl": item.state.ttl,
-        "dir": str(item.root),
-        "windows": process.window_titles(item.state.maya_pid),
-    }
 
 
 def activity(row: dict[str, Any]) -> str:
@@ -347,7 +305,7 @@ def activity(row: dict[str, Any]) -> str:
 
 def status(args: argparse.Namespace) -> int:
     now = time.time()
-    rows = [describe(item, now) for item in session.sessions(temp_dir())]
+    rows = [registry.describe(item, now) for item in registry.running(temp_dir())]
     if args.json:
         print(json.dumps(rows, ensure_ascii=False))
         return OK

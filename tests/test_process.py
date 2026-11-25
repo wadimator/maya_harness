@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from maya_harness import process
+from maya_harness import process, win32
 from maya_harness.process import affinity_mask, environment_block
 
 CREATE_NO_WINDOW = 0x08000000
@@ -40,16 +40,15 @@ def test_maya_alive_needs_the_recorded_creation_time(tmp_path: Path) -> None:
     fake = tmp_path / "maya.exe"
     shutil.copy(Path(os.environ["SystemRoot"], "System32", "PING.EXE"), fake)
     child = subprocess.Popen([str(fake), "-n", "60", "127.0.0.1"], stdout=subprocess.DEVNULL)
-    handle = process.kernel32.OpenProcess(process.PROCESS_QUERY_LIMITED_INFORMATION, False, child.pid)
+    handle = win32.kernel32.OpenProcess(win32.PROCESS_QUERY_LIMITED_INFORMATION, False, child.pid)
     try:
-        created = process.creation_time(handle)
+        created = win32.creation_time(handle)
         assert process.maya_alive(child.pid, created)
         assert not process.maya_alive(child.pid, created + 1)
-        assert process.maya_alive(child.pid, 0)  # an old state.json: the pid decides
     finally:
         child.kill()
         child.wait(5)
-        process.kernel32.CloseHandle(handle)
+        win32.kernel32.CloseHandle(handle)
     assert not process.maya_alive(child.pid, created)
 
 
@@ -58,12 +57,11 @@ def test_kill_maya_kills_only_our_maya(tmp_path: Path) -> None:
     fake = tmp_path / "maya.exe"
     shutil.copy(Path(os.environ["SystemRoot"], "System32", "PING.EXE"), fake)
     child = subprocess.Popen([str(fake), "-n", "60", "127.0.0.1"], stdout=subprocess.DEVNULL)
-    rights = process.PROCESS_QUERY_LIMITED_INFORMATION | process.SYNCHRONIZE
-    handle = process.kernel32.OpenProcess(rights, False, child.pid)
+    rights = win32.PROCESS_QUERY_LIMITED_INFORMATION | win32.SYNCHRONIZE
+    handle = win32.kernel32.OpenProcess(rights, False, child.pid)
     try:
-        created = process.creation_time(handle)
+        created = win32.creation_time(handle)
         assert process.kill_maya(child.pid, created + 1)  # the pid names another process: ours is gone
-        assert not process.kill_maya(child.pid, 0)  # an old state.json: cannot tell
         assert child.poll() is None
         assert process.kill_maya(child.pid, created)
         assert child.wait(5) == 1
@@ -71,7 +69,7 @@ def test_kill_maya_kills_only_our_maya(tmp_path: Path) -> None:
         assert process.kill_maya(0x7FFFFFFC, 1)  # no such process
     finally:
         child.kill()
-        process.kernel32.CloseHandle(handle)
+        win32.kernel32.CloseHandle(handle)
 
 
 GRANDCHILD = f"""
@@ -89,24 +87,24 @@ def test_a_released_maya_takes_what_it_started_along_when_killed(stub: Callable[
     child = stub(GRANDCHILD, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     maya = object.__new__(process.MayaProcess)
     maya.desktop, maya.closed, maya._lock = None, False, threading.Lock()
-    maya.job = process.kernel32.CreateJobObjectW(None, None)
-    maya._set_job_limits(process.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
-    maya.handle = process.kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, child.pid)
-    assert process.kernel32.AssignProcessToJobObject(maya.job, maya.handle)
+    maya.job = win32.kernel32.CreateJobObjectW(None, None)
+    maya._set_job_limits(win32.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+    maya.handle = win32.kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, child.pid)
+    assert win32.kernel32.AssignProcessToJobObject(maya.job, maya.handle)
     assert child.stdin and child.stdout
     child.stdin.write("\n")
     child.stdin.flush()
     pid = int(child.stdout.readline())
-    grandchild = process.kernel32.OpenProcess(process.PROCESS_TERMINATE | process.SYNCHRONIZE, False, pid)
+    grandchild = win32.kernel32.OpenProcess(win32.PROCESS_TERMINATE | win32.SYNCHRONIZE, False, pid)
     try:
         maya.release()
         assert child.poll() is None  # the job no longer closes with the harness
         child.kill()
         child.wait(5)
-        assert process.kernel32.WaitForSingleObject(grandchild, 5000) == 0
+        assert win32.kernel32.WaitForSingleObject(grandchild, 5000) == 0
     finally:
-        process.kernel32.TerminateProcess(grandchild, 1)
-        process.kernel32.CloseHandle(grandchild)
+        win32.kernel32.TerminateProcess(grandchild, 1)
+        win32.kernel32.CloseHandle(grandchild)
 
 
 def test_modal_dialog_is_the_other_windows_while_the_main_window_is_disabled(
@@ -117,7 +115,7 @@ def test_modal_dialog_is_the_other_windows_while_the_main_window_is_disabled(
     windows = [main]
     enabled = [True]
     monkeypatch.setattr(process, "_windows", lambda pid, desktop: windows)
-    monkeypatch.setattr(process.user32, "IsWindowEnabled", lambda window: enabled[0])
+    monkeypatch.setattr(win32.user32, "IsWindowEnabled", lambda window: enabled[0])
     windows.append((2, "Script Editor"))
     assert process.modal_dialog(10) == []
     enabled[0] = False

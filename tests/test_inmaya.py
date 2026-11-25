@@ -1,8 +1,12 @@
+import json
+import os
+import sys
+import types
 from pathlib import Path
 
 import pytest
 
-from maya_harness import inmaya, session
+from maya_harness import inmaya
 from maya_harness.inmaya import Check
 
 
@@ -76,11 +80,112 @@ def test_run_sections_refuses_what_the_scenario_has_not(
 
 
 def test_work_dir_is_the_session_marker(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(session.MARKER, r"C:\s\work")
+    monkeypatch.setenv(inmaya.MARKER, r"C:\s\work")
     assert inmaya.work_dir() == Path(r"C:\s\work")
 
 
 def test_work_dir_outside_a_session_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv(session.MARKER, raising=False)
+    monkeypatch.delenv(inmaya.MARKER, raising=False)
     with pytest.raises(RuntimeError, match="run it with maya-harness"):
         inmaya.work_dir()
+
+
+def test_reload_drops_the_packages_their_submodules_and_the_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("fake_pkg", "fake_pkg.sub", "fake_pkg_other", "check_fake", "other_check_fake"):
+        monkeypatch.setitem(sys.modules, name, sys)
+    inmaya.reload(["fake_pkg"], "check_")
+    assert [name for name in ("fake_pkg", "fake_pkg.sub", "check_fake") if name in sys.modules] == []
+    assert sys.modules["fake_pkg_other"] is sys
+    assert sys.modules["other_check_fake"] is sys
+
+
+def test_reload_without_a_prefix_keeps_the_rest(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "check_fake", sys)
+    inmaya.reload([])
+    assert sys.modules["check_fake"] is sys
+
+
+def test_run_scenario_imports_the_scenario_and_its_package_fresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sys, "path", [str(tmp_path), "elsewhere", str(tmp_path)])
+    for name in ("fake_plugin", "check_fake"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    (tmp_path / "fake_plugin.py").write_text("VALUE = 'old'\n", encoding="utf-8")
+    scenario = (
+        "import fake_plugin\n\ndef run(**params):\n    return {'failures': [], 'value': fake_plugin.VALUE, **params}\n"
+    )
+    (tmp_path / "check_fake.py").write_text(scenario, encoding="utf-8")
+    report = inmaya.run_scenario(str(tmp_path), "check_fake", {"control": "x"}, ["fake_plugin"])
+    assert json.loads(report) == {"failures": [], "value": "old", "control": "x"}
+    assert sys.path == [str(tmp_path), "elsewhere"]
+    (tmp_path / "fake_plugin.py").write_text(
+        "VALUE = 'newer'  # another size: a .pyc of the same size and second is taken as fresh\n", encoding="utf-8"
+    )
+    (tmp_path / "check_fake.py").write_text(scenario.replace("'value'", "'changed'"), encoding="utf-8")
+    report = inmaya.run_scenario(str(tmp_path), "check_fake", {}, ["fake_plugin"])
+    assert json.loads(report) == {"failures": [], "changed": "newer"}
+    monkeypatch.delitem(sys.modules, "fake_plugin")
+    monkeypatch.delitem(sys.modules, "check_fake")
+
+
+class FakeCmds:
+    """`maya.cmds` for `startup`: what it was asked to do."""
+
+    def __init__(self, missing: str = "") -> None:
+        self.missing = missing
+        self.plugins: list[str] = []
+        self.deferred: list[object] = []
+        self.options: list[object] = []
+
+    def optionVar(self, **kwargs: object) -> None:  # noqa: N802 - the name of maya.cmds
+        self.options.append(kwargs)
+
+    def evalDeferred(self, function: object) -> None:  # noqa: N802
+        self.deferred.append(function)
+
+    def loadPlugin(self, name: str, quiet: bool) -> None:  # noqa: N802
+        if name == self.missing:
+            raise RuntimeError(f"Plug-in, {name}, was not found on MAYA_PLUG_IN_PATH.")
+        self.plugins.append(name)
+
+
+@pytest.fixture
+def cmds(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> FakeCmds:
+    fake = FakeCmds()
+    maya = types.ModuleType("maya")
+    maya.cmds = fake  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "maya", maya)
+    monkeypatch.setitem(sys.modules, "maya.cmds", fake)  # type: ignore[arg-type]
+    monkeypatch.setenv(inmaya.MARKER, str(tmp_path))
+    return fake
+
+
+def test_startup_loads_the_project_plugins_then_dcc_mcp(
+    cmds: FakeCmds, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv(inmaya.PLUGINS, os.pathsep.join(["fbxmaya", "", "gameFbxExporter"]))
+    monkeypatch.setenv(inmaya.TTL, "0")
+    inmaya.startup()
+    assert cmds.plugins == ["fbxmaya", "gameFbxExporter", "dcc_mcp_maya_plugin"]
+    assert cmds.options == [{"intValue": ("SafeModeUserSetupHashOption", 0)}]
+    assert cmds.deferred == []  # no idle timer
+    assert (tmp_path / inmaya.LAST_CALL).is_file()
+    assert (tmp_path / inmaya.STARTUP).read_text(encoding="utf-8") == "dcc_mcp_maya_plugin loaded"
+
+
+def test_startup_starts_the_idle_timer_with_a_ttl(cmds: FakeCmds, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(inmaya.PLUGINS, raising=False)
+    monkeypatch.setenv(inmaya.TTL, "5")
+    inmaya.startup()
+    assert len(cmds.deferred) == 1
+    assert cmds.plugins == ["dcc_mcp_maya_plugin"]
+
+
+def test_startup_stops_at_a_missing_plugin(cmds: FakeCmds, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    cmds.missing = "no_such_plugin"
+    monkeypatch.setenv(inmaya.PLUGINS, "no_such_plugin")
+    with pytest.raises(RuntimeError, match="no_such_plugin"):
+        inmaya.startup()
+    assert cmds.plugins == []
+    assert (tmp_path / inmaya.STARTUP).read_text(encoding="utf-8") == "userSetup.py loaded"

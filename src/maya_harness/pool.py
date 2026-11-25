@@ -1,27 +1,11 @@
-"""`maya-harness run`: the project's check scenarios, in Mayas of their own or in one at `--url`.
-
-* A scenario is a module `check_*.py` in `[tool.maya_harness.scenarios].dir`; its
-  `run(**params)` returns a report whose `failures` are `<name>: <message>` (`inmaya.Check`).
-  Each run imports it fresh: the scenario modules and the project's `reload` packages are
-  dropped from `sys.modules` first, so the code on disk is what runs.
-* A control breaks on purpose what its scenario checks and must fail first on an expected
-  failure; the expectation is in the table of runs, since the harness cannot import a scenario,
-  which needs Maya. The table (`[tool.maya_harness.scenarios].runs`) is TOML:
-
-  ```toml
-  [[run]]
-  scenario = "check_full"
-  control = "1"            # absent for the scenario itself
-  expect = "reopened.ma"   # the first failure of the control; only with control
-  seconds = 51             # measured; `all` runs the longest first, so the Mayas end close together
-  ```
+"""Where the runs of `maya-harness run` go: a pool of Mayas of their own, or one at `--url`.
 
 * The pool: up to `--jobs` worker threads; each, while runs are left, starts a Maya of its own (a
   session in the job of this process), waits for it and takes the next run from one queue. A
   Maya leaves as soon as the queue is empty, or when it crashes or times out: it fails its run,
   and the others take the rest. Ctrl+C lets no Maya take another run. A Maya that leaves is
-  killed and its session directory removed at once, any left at the end too; a session writes no
-  `state.json`, so `exec` and `stop` never pick a Maya of a run.
+  killed and its session directory removed at once, any left at the end too; a session is
+  never released and writes no `state.json`, so `exec` and `stop` never pick a Maya of a run.
 * Each Maya is started and waited for in its own worker, not all started first and closed at
   the end: a worker that cannot start its Maya yet (every slot of the machine is taken, see
   `slots`) holds up no other, and a Maya with nothing left to run holds nothing up to the end of
@@ -37,118 +21,23 @@ import queue
 import sys
 import threading
 import time
-import tomllib
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, NamedTuple, TextIO
+from typing import TextIO
 
-from . import config, session, slots, transport
+from . import call, config, session, transport
+from .scenarios import Outcome, Run, label_of, print_summary, verdict
 
-PREFIX = "check_"  # a scenario's module name; the modules with it are dropped before each run
 JOBS = 3
 MAX_JOBS = 4
 TIMEOUT = 900  # seconds per scenario: a run may reopen scenes with heavy rigs
-RUN_KEYS = ("scenario", "control", "expect", "seconds")
-
-# Executed in Maya: fresh project and scenario modules, then the scenario.
-CODE = """
-import json, sys
-_path = {directory!r}
-while _path in sys.path:
-    sys.path.remove(_path)
-sys.path.insert(0, _path)
-for _name in tuple(sys.modules):
-    if _name.split(".")[0] in {reload!r} or _name.startswith({prefix!r}):
-        del sys.modules[_name]
-import {module}
-json.dumps({module}.run(**{params!r}), ensure_ascii=False, default=str)
-"""
 
 
-class Refused(ValueError):
-    """The arguments or the table of runs are wrong: no Maya is started."""
-
-
-class Run(NamedTuple):
-    scenario: str
-    params: dict[str, str]
-    expected: str  # the first failure a control must fail on; empty for a scenario
-
-
-class Outcome(NamedTuple):
-    seconds: float
-    ok: bool
-    text: str
-    maya: int  # the Maya's number; 0 for the one at --url
-
-
-def load_runs(path: Path) -> list[Run]:
-    """The table of runs, the longest first."""
-    try:
-        data = tomllib.loads(path.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError) as error:
-        raise Refused(f"no table of runs: {error}") from error
-    entries = data.get("run", [])
-    if not isinstance(entries, list) or not entries:
-        raise Refused(f"{path}: no [[run]] entries")
-    measured: list[tuple[float, Run]] = []
-    seen: set[tuple[str, str]] = set()
-    for entry in entries:
-        if not isinstance(entry, dict):
-            raise Refused(f"{path}: {entry!r}: a run is a [[run]] table")
-        unknown = sorted(set(entry) - set(RUN_KEYS))
-        scenario, control, expected = entry.get("scenario"), entry.get("control", ""), entry.get("expect", "")
-        seconds = entry.get("seconds", 0)
-        if unknown or not isinstance(scenario, str) or not scenario.startswith(PREFIX):
-            raise Refused(f"{path}: {entry}: a run is {', '.join(RUN_KEYS)}, its scenario {PREFIX}<name>")
-        if not isinstance(control, str) or not isinstance(expected, str) or bool(control) != bool(expected):
-            raise Refused(f"{path}: {entry}: a control and its expect go together, as strings")
-        if not isinstance(seconds, int | float) or isinstance(seconds, bool):
-            raise Refused(f"{path}: {entry}: seconds must be a number")
-        if (scenario, control) in seen:
-            raise Refused(f"{path}: {entry}: the run is listed twice")
-        seen.add((scenario, control))
-        measured.append((seconds, Run(scenario, {"control": control} if control else {}, expected)))
-    return [run for _, run in sorted(measured, key=lambda item: -item[0])]
-
-
-def parse(items: list[str], table: list[Run]) -> list[Run]:
-    """Scenario names, or one scenario and its `name=value` parameters; `all` is the table."""
-    names = [item for item in items if "=" not in item]
-    params = dict(item.split("=", 1) for item in items if "=" in item)
-    # A control or a section among several names would replace every run of its scenario: `all section=film`
-    # would make 20 runs of it.
-    if params and (len(names) != 1 or names == ["all"]):
-        raise Refused("A control or a section runs alone: <scenario> control=<value> | section=<name>.")
-    if names == ["all"]:
-        return list(table)
-    expected = {(run.scenario, run.params["control"]): run.expected for run in table if run.params}
-    return [Run(name, params, expected.get((name, params.get("control", "")), "")) for name in names]
-
-
-def refuse_unknown(runs: list[Run], scenarios: config.Scenarios) -> None:
-    """A run of a scenario that is not there, or of a control the table does not list: a typo
-    would run the plain scenario."""
-    for run in runs:  # `all` among other names is caught here too: there is no all.py
-        if not run.scenario.startswith(PREFIX) or not (scenarios.dir / f"{run.scenario}.py").is_file():
-            raise Refused(f"no scenario {run.scenario!r} in {scenarios.dir}")
-        if set(run.params) == {"section"}:  # the scenario itself refuses a section it has not
-            continue
-        if run.params and (set(run.params) != {"control"} or not run.expected):
-            raise Refused(
-                f"{run.scenario} has no control {run.params}: the controls are listed in {scenarios.runs}, "
-                "or section=<name>"
-            )
-
-
-def code_of(run: Run, directory: Path, reload: tuple[str, ...]) -> str:
-    return CODE.format(directory=str(directory), reload=reload, prefix=PREFIX, module=run.scenario, params=run.params)
-
-
-def run_scenario(url: str, code: str, watch: transport.Watch | None = None) -> tuple[list[str] | None, str]:
+def run_scenario(execute: Callable[[str, float], transport.Result], code: str) -> tuple[list[str] | None, str]:
     """The scenario's failures, None when it raised or returned no report with a list of failures, and its
     output: the caller prints it in one piece, and the output of runs in other Mayas does not get between its
-    lines. `watch` cuts a call that stands on a modal dialog short, with `CallAborted`."""
-    result = transport.execute(url, code, TIMEOUT, watch)
+    lines. `execute` is the call of a Maya: one that stands on a modal dialog ends in `CallAborted`."""
+    result = execute(code, TIMEOUT)
     output = [text.rstrip() for text in (result.stdout, result.stderr) if text]
     if not result.success:
         output.append(result.error or json.dumps(result.raw, ensure_ascii=False)[-6000:])
@@ -165,82 +54,21 @@ def run_scenario(url: str, code: str, watch: transport.Watch | None = None) -> t
     return list(report["failures"]), "\n".join(output)
 
 
-def verdict(expected: str, failures: list[str] | None) -> tuple[bool, str]:
-    """A control passes when its scenario fails first on the expected failure: a failure elsewhere
-    means the control broke something else, or the check it stands for no longer holds. A scenario that
-    raised fails either way.
-
-    A failure's name is up to its first `:`; it must equal the expected one, as a prefix
-    `fingers.gloves` would match `fingers.gloves_rad`."""
-    if failures is None:
-        return False, "FAIL: raised"
-    if not expected:
-        return (True, "ok") if not failures else (False, f"FAIL: {len(failures)} failures")
-    if not failures:
-        return False, "FAIL: the control passed"
-    first = failures[0].split(":", 1)[0]
-    if first != expected:
-        return False, f"FAIL: the control failed on {first}, expected {expected}"
-    return True, f"ok: the control failed on {first}"
-
-
-def label_of(run: Run) -> str:
-    return " ".join([run.scenario, *(f"{name}={value}" for name, value in run.params.items())])
-
-
-def print_summary(runs: list[Run], outcomes: dict[int, Outcome], out: TextIO) -> bool:
-    """The summary in the order of the runs; a run no Maya got to is «not run». True when every run passed."""
-    print(file=out)
-    for index, run in enumerate(runs):
-        label = label_of(run)
-        if index in outcomes:
-            seconds, _, text, maya = outcomes[index]
-            print(f"{label:<36} maya{maya} {seconds:6.1f} s  {text}", file=out, flush=True)
-        else:
-            print(f"{label:<36} {'':>14}  not run", file=out, flush=True)
-    return passed(runs, outcomes)
-
-
-def passed(runs: list[Run], outcomes: dict[int, Outcome]) -> bool:
-    return len(outcomes) == len(runs) and all(outcome.ok for outcome in outcomes.values())
-
-
-def summary(runs: list[Run], outcomes: dict[int, Outcome]) -> dict[str, Any]:
-    """The summary for `--json`."""
-    rows = []
-    for index, run in enumerate(runs):
-        row: dict[str, Any] = {"scenario": run.scenario, "params": run.params, "expect": run.expected}
-        outcome = outcomes.get(index)
-        if outcome is None:
-            row |= {"ok": False, "text": "not run"}
-        else:
-            row |= {"ok": outcome.ok, "text": outcome.text, "seconds": round(outcome.seconds, 1), "maya": outcome.maya}
-        rows.append(row)
-    return {"success": passed(runs, outcomes), "runs": rows}
-
-
-def run_at_url(
-    url: str, work: Path, runs: list[Run], codes: list[str], out: TextIO, watch: transport.Watch | None = None
-) -> dict[int, Outcome]:
-    """The runs one after another in the Maya at `url`, a session `start` left running; the summary is printed
+def run_at(target: call.Target, runs: list[Run], codes: list[str], out: TextIO) -> dict[int, Outcome]:
+    """The runs one after another in the Maya `target`, a session `start` left running; the summary is printed
     even when a run is cut short. A call Maya does not answer fails its run, and the runs after it are «not run»."""
     outcomes: dict[int, Outcome] = {}
     try:
         for index, (run, code) in enumerate(zip(runs, codes, strict=True)):
             print(f"=== {label_of(run)}", file=out, flush=True)
             start = time.monotonic()
-            session.touch(work)
-            slots.begin_call(work)
             try:
-                failures, output = run_scenario(url, code, watch)
+                failures, output = run_scenario(target.execute, code)
             # Maya is gone, busy or on a dialog: the runs after it wait
             except (OSError, transport.TransportError) as error:
-                text = f"FAIL: no reply from {url} — {type(error).__name__}: {error}"
+                text = f"FAIL: no reply from {target.url} — {type(error).__name__}: {error}"
                 outcomes[index] = Outcome(time.monotonic() - start, False, text, 0)
                 break
-            finally:
-                slots.end_call(work)
-                session.touch(work)
             print(output, file=out, flush=True)
             outcomes[index] = Outcome(time.monotonic() - start, *verdict(run.expected, failures), 0)
     finally:
@@ -327,7 +155,7 @@ class Pool:
                 return
             begin = time.monotonic()
             try:
-                started.wait(transport.STARTUP_TIMEOUT)
+                started.wait()
             except session.StartError as error:
                 if not self.stop.is_set():
                     self.say(f"{name}: {error}", sys.stderr)
@@ -349,7 +177,7 @@ class Pool:
             self.say(f"{name}: {label_of(run)}", self.out)
             start = time.monotonic()
             try:
-                failures, output = run_scenario(started.url, self.codes[index], started.watch)
+                failures, output = run_scenario(started.execute, self.codes[index])
             # Maya crashed, the scenario timed out, or Maya stands on a dialog nobody on its hidden desktop
             # answers: the `finally` of `work` kills it
             except (OSError, transport.TransportError) as error:

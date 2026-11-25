@@ -15,8 +15,8 @@
 ```
 
 * `<тип>` — из таблицы ниже.
-* `<scope>` — модуль пакета: `process`, `session`, `transport`, `config`, `cli`, `slots`, `run`,
-  `inmaya`; или `docs`.
+* `<scope>` — модуль пакета: `win32`, `process`, `transport`, `call`, `slots`, `session`,
+  `registry`, `config`, `scenarios`, `pool`, `inmaya`, `cli`; или `docs`.
   Опускается, если правка общая (`chore: …`).
 * Описание — с маленькой буквы, без точки в конце; говорит, что стало иначе.
 * Тело опционально: через пустую строку — «почему».

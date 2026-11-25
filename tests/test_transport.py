@@ -91,18 +91,6 @@ def test_server_refusal_is_a_failed_result(monkeypatch: pytest.MonkeyPatch) -> N
     assert "no tool" in result.error
 
 
-def test_connect_refuses_a_maya_without_the_marker(monkeypatch: pytest.MonkeyPatch) -> None:
-    FakeServer(monkeypatch, ok(output=""))
-    with pytest.raises(transport.TransportError, match="not a Maya started by maya_harness"):
-        transport.connect(URL, timeout=10)
-
-
-def test_connect_refuses_another_session(monkeypatch: pytest.MonkeyPatch) -> None:
-    FakeServer(monkeypatch, ok(output="C:/other/work"))
-    with pytest.raises(transport.TransportError, match="another Maya"):
-        transport.connect(URL, timeout=10, work=transport.Path("C:/mine/work"))
-
-
 def test_a_refused_connection_did_not_reach_maya(monkeypatch: pytest.MonkeyPatch) -> None:
     """urllib wraps in URLError only what fails while connecting or sending: Maya got no request."""
 

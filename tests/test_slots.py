@@ -3,14 +3,13 @@
 import json
 import os
 import subprocess
-import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
-from maya_harness import process, slots
+from maya_harness import slots, win32
 
 Stub = Callable[..., subprocess.Popen[str]]
 HOLD = "import sys; sys.stdin.readline()"  # a holder that lives until told
@@ -93,14 +92,14 @@ def test_a_slot_is_free_once_its_holder_exits_though_its_child_lives(
     holder.stdin.write("\n")
     holder.stdin.flush()
     pid = int(holder.stdout.readline())
-    grandchild = process.kernel32.OpenProcess(process.PROCESS_TERMINATE | process.SYNCHRONIZE, False, pid)
+    grandchild = win32.kernel32.OpenProcess(win32.PROCESS_TERMINATE | win32.SYNCHRONIZE, False, pid)
     try:
         assert holder.wait(5) == 0
-        assert process.kernel32.WaitForSingleObject(grandchild, 0) == process.WAIT_TIMEOUT  # alive
+        assert win32.kernel32.WaitForSingleObject(grandchild, 0) == win32.WAIT_TIMEOUT  # alive
         assert free(own_slots)
     finally:
-        process.kernel32.TerminateProcess(grandchild, 1)
-        process.kernel32.CloseHandle(grandchild)
+        win32.kernel32.TerminateProcess(grandchild, 1)
+        win32.kernel32.CloseHandle(grandchild)
 
 
 def test_a_failed_give_frees_the_slot(own_slots: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -163,32 +162,12 @@ def test_holders_are_the_taken_slots_only(own_slots: Path, monkeypatch: pytest.M
     """A free slot keeps the .holder of its last Maya; a holder that is not a live Maya is starting."""
     monkeypatch.setenv(slots.VARIABLE, "3")
     first, second = slots.take(0), slots.take(0)
-    second.describe(
-        {"pid": os.getpid(), "created": 1, "project": "p", "command": "run", "url": "u", "work": "w", "time": 0}
-    )
-    first.describe({"pid": 1, "created": 1, "project": "p", "command": "run", "url": "u", "work": "w", "time": 0})
+    second.describe(slots.Holder(2, os.getpid(), 1, "p", "run", "u", "w", 0))
+    first.describe(slots.Holder(1, 1, 1, "p", "run", "u", "w", 0))
     first.release()
     assert slots.holders() == [slots.Holder(2)]
     second.release()
     assert slots.holders() == []
-
-
-def test_in_call_is_the_start_of_a_call_whose_process_lives(tmp_path: Path) -> None:
-    assert slots.in_call(tmp_path) is None
-    slots.begin_call(tmp_path)
-    since = slots.in_call(tmp_path)
-    assert since is not None and abs(since - time.time()) < 60
-    slots.end_call(tmp_path)
-    assert slots.in_call(tmp_path) is None
-    slots.end_call(tmp_path)  # twice: the file is gone already
-
-
-def test_in_call_of_a_dead_process_is_none(tmp_path: Path) -> None:
-    """An exec killed in its wait leaves the file behind: Maya is not busy forever."""
-    dead = subprocess.Popen([sys.executable, "-c", ""])
-    dead.wait()
-    (tmp_path / "in_call").write_text(json.dumps({"pid": dead.pid, "since": time.time()}), encoding="utf-8")
-    assert slots.in_call(tmp_path) is None
 
 
 def test_a_maya_of_start_in_a_call_is_busy_not_idle(tmp_path: Path) -> None:

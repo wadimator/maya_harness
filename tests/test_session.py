@@ -1,118 +1,17 @@
+import dataclasses
 import json
 import os
-from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
-from maya_harness import process, session, slots
-from maya_harness.session import SessionParams, State
+from maya_harness import inmaya, registry, session, slots, win32
+from maya_harness.registry import State
+from maya_harness.session import SessionParams
 
 PROJECT = "Retarget_Master"  # `_` in the name: the directory name cannot be split into a pid
-DEAD, ALIVE, OTHER_ALIVE = 101, 202, 303
 NOW = 1_000_000_000.0
-GIVE = process.give  # the real one: `installed` replaces it
-
-
-def alive(pid: int) -> bool:
-    return pid in (ALIVE, OTHER_ALIVE)
-
-
-def maya(pid: int, created: int) -> bool:
-    return alive(pid)
-
-
-def make_dir(temp: Path, runner_pid: object, maya_pid: object, *, age: float = 0.0, created: int = 0) -> Path:
-    root = temp / f"{session.PREFIX}{PROJECT}_{DEAD}_abc{runner_pid}{maya_pid}"
-    root.mkdir()
-    state = {
-        "project": PROJECT,
-        "project_root": "C:/x",
-        "runner_pid": runner_pid,
-        "maya_pid": maya_pid,
-        "url": "http://127.0.0.1:1/mcp",
-        "started": NOW,
-        "ttl": 60,
-    }
-    if created:  # without it, state.json is one from before the creation time
-        state["maya_created"] = created
-    (root / session.STATE_FILE).write_text(json.dumps(state), encoding="utf-8")
-    os.utime(root, (NOW - age, NOW - age))
-    return root
-
-
-def remove(temp: Path) -> list[Path]:
-    return session.remove_stale(temp, alive=alive, now=lambda: NOW, maya=maya)
-
-
-def test_dead_runner_and_dead_maya_is_removed(tmp_path: Path) -> None:
-    root = make_dir(tmp_path, DEAD, DEAD)
-    assert remove(tmp_path) == [root]
-    assert not root.exists()
-
-
-def test_live_runner_keeps_the_directory(tmp_path: Path) -> None:
-    root = make_dir(tmp_path, ALIVE, DEAD)
-    assert remove(tmp_path) == []
-    assert root.exists()
-
-
-def test_live_maya_keeps_the_directory_of_a_dead_runner(tmp_path: Path) -> None:
-    root = make_dir(tmp_path, DEAD, ALIVE)
-    assert remove(tmp_path) == []
-    assert root.exists()
-
-
-def test_garbage_state_is_removed_when_old(tmp_path: Path) -> None:
-    root = make_dir(tmp_path, "x", ALIVE, age=session.UNCLAIMED_AGE + 1)
-    assert remove(tmp_path) == [root]
-
-
-def test_garbage_state_is_kept_when_fresh(tmp_path: Path) -> None:
-    root = make_dir(tmp_path, "x", ALIVE)
-    assert remove(tmp_path) == []
-    assert root.exists()
-
-
-def test_fresh_directory_without_state_is_kept(tmp_path: Path) -> None:
-    root = tmp_path / f"{session.PREFIX}{PROJECT}_{DEAD}_new"
-    root.mkdir()
-    os.utime(root, (NOW, NOW))
-    assert remove(tmp_path) == []
-    old = tmp_path / f"{session.PREFIX}{PROJECT}_{DEAD}_old"
-    old.mkdir()
-    os.utime(old, (NOW - session.UNCLAIMED_AGE - 1,) * 2)
-    assert remove(tmp_path) == [old]
-
-
-def test_sessions_lists_live_mayas_oldest_first(tmp_path: Path) -> None:
-    make_dir(tmp_path, DEAD, DEAD)
-    first = make_dir(tmp_path, DEAD, ALIVE)
-    second = make_dir(tmp_path, ALIVE, OTHER_ALIVE)
-    state = json.loads((second / session.STATE_FILE).read_text(encoding="utf-8"))
-    state["started"] = NOW + 1
-    (second / session.STATE_FILE).write_text(json.dumps(state), encoding="utf-8")
-    assert [found.root for found in session.sessions(tmp_path, maya=maya)] == [first, second]
-    assert session.read_state(first).maya_created == 0
-
-
-def test_a_maya_pid_counts_only_with_its_creation_time(tmp_path: Path) -> None:
-    """Windows reuses pids: the recorded creation time goes along with the Maya pid."""
-    root = make_dir(tmp_path, DEAD, ALIVE, created=7)
-
-    def created_at(time: int) -> Callable[[int, int], bool]:
-        return lambda pid, created: alive(pid) and created == time
-
-    assert [found.root for found in session.sessions(tmp_path, maya=created_at(7))] == [root]
-    assert session.sessions(tmp_path, maya=created_at(8)) == []
-    assert session.remove_stale(tmp_path, alive=alive, now=lambda: NOW, maya=created_at(7)) == []
-    assert session.remove_stale(tmp_path, alive=alive, now=lambda: NOW, maya=created_at(8)) == [root]
-
-
-def test_state_round_trip(tmp_path: Path) -> None:
-    state = State(PROJECT, "C:/x", 1, 2, "http://127.0.0.1:1/mcp", NOW, 60, 134_000_000_000_000_000)
-    session.write_state(tmp_path, state)
-    assert session.read_state(tmp_path) == state
+GIVE = win32.give  # the real one: `installed` replaces it
 
 
 PARAMS = SessionParams(
@@ -185,15 +84,38 @@ def test_prepare_copies_the_package_for_the_code_in_maya(tmp_path: Path) -> None
     root = tmp_path / "session"
     env = session.prepare(root, SessionParams(PROJECT, tmp_path), module, {}, 1)
     copy = Path(env["PYTHONPATH"]) / "maya_harness"
+    assert sorted(path.name for path in copy.iterdir()) == ["__init__.py", "inmaya.py"]
     assert (copy / "inmaya.py").read_bytes() == (Path(session.__file__).parent / "inmaya.py").read_bytes()
-    assert not list(copy.rglob("__pycache__"))
+    user_setup = root / "app" / "2025" / "scripts" / "userSetup.py"
+    assert user_setup.read_text(encoding="utf-8") == session.USER_SETUP
 
 
-def test_user_setup_loads_project_plugins_then_dcc_mcp() -> None:
-    code = session.user_setup(("fbxmaya", "gameFbxExporter"))
-    compile(code, "userSetup.py", "exec")
-    assert "('fbxmaya', 'gameFbxExporter', 'dcc_mcp_maya_plugin')" in code
-    assert 'SafeModeUserSetupHashOption", 0' in code
+def test_user_setup_is_inmaya_startup() -> None:
+    compile(session.USER_SETUP, "userSetup.py", "exec")
+    assert "inmaya.startup()" in session.USER_SETUP
+
+
+def test_user_setup_writes_the_traceback_where_the_session_reads_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken() -> None:
+        raise RuntimeError("no plugin")
+
+    monkeypatch.setattr(inmaya, "startup", broken)
+    monkeypatch.setenv(inmaya.MARKER, str(tmp_path))
+    with pytest.raises(RuntimeError):
+        exec(session.USER_SETUP, {})
+    status = (tmp_path / inmaya.STARTUP).read_text(encoding="utf-8")
+    assert status.startswith("Traceback") and "no plugin" in status
+
+
+def test_environment_passes_the_plugins_and_the_ttl_to_startup() -> None:
+    env = session.environment(
+        BASE, Path("C:/s"), dataclasses.replace(PARAMS, plugins=("fbxmaya", "gameFbxExporter")), 1, 5
+    )
+    assert env[inmaya.PLUGINS] == os.pathsep.join(["fbxmaya", "gameFbxExporter"])
+    assert env[inmaya.TTL] == "5"
+    assert session.environment(BASE, Path("C:/s"), SessionParams(PROJECT, Path("C:/p")), 1)[inmaya.PLUGINS] == ""
 
 
 @pytest.mark.parametrize(
@@ -242,6 +164,7 @@ class FakeMaya:
         self.pid = 4242
         self.created = 7
         self.handle = 0
+        self.desktop = None
         self.closed = False
         self.released = False
 
@@ -267,7 +190,7 @@ def installed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     monkeypatch.setenv("MAYAPY_EXE", str(tmp_path / "mayapy.exe"))
     monkeypatch.setenv(session.MODULE_VARIABLE, str(tmp_path / "dcc_mcp_maya.mod"))
     monkeypatch.setattr(session.process, "MayaProcess", FakeMaya)
-    monkeypatch.setattr(session.process, "give", lambda *_: None)  # a fake Maya has no process to hold a slot
+    monkeypatch.setattr(win32, "give", lambda *_: None)  # a fake Maya has no process to hold a slot
     monkeypatch.setattr(session.transport, "server_logs", lambda pid: [])
     temp = tmp_path / "temp"
     temp.mkdir()
@@ -278,7 +201,7 @@ STARTED = SessionParams(PROJECT, Path("C:/project"))
 
 
 def session_dirs(temp: Path) -> list[Path]:
-    return list(temp.glob(f"{session.PREFIX}*"))
+    return list((temp / registry.SESSIONS).glob(f"{registry.PREFIX}*"))
 
 
 @pytest.mark.parametrize("missing", ["maya.exe", "dcc_mcp_maya.mod"])
@@ -307,8 +230,8 @@ def test_with_closes_the_maya_and_removes_the_directory(
         if raised is KeyboardInterrupt:
             raise KeyboardInterrupt
 
-    monkeypatch.setattr(session.transport, "wait_for_server", wait_for_server)
-    monkeypatch.setattr(session.transport, "connect", lambda url, timeout, work: work)
+    monkeypatch.setattr(session.Session, "_wait_for_server", wait_for_server)
+    monkeypatch.setattr(session.call, "connect", lambda *_, **__: None)
     with pytest.raises(raised), session.start(STARTED, temp=installed) as started:
         started.wait(1)
         raise raised
@@ -320,9 +243,63 @@ def test_wait_turns_a_timeout_into_start_error(installed: Path, monkeypatch: pyt
     def wait_for_server(*args: object) -> None:
         raise TimeoutError("no server")
 
-    monkeypatch.setattr(session.transport, "wait_for_server", wait_for_server)
+    monkeypatch.setattr(session.Session, "_wait_for_server", wait_for_server)
     with session.start(STARTED, temp=installed) as started, pytest.raises(session.StartError, match="Maya 4242"):
         started.wait(1)
+
+
+def test_wait_shows_the_traceback_of_startup(installed: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A plugin that does not load: `start` fails at once, with the traceback `userSetup.py` wrote."""
+    monkeypatch.setattr(session.transport, "healthy", lambda url: False)
+    with session.start(STARTED, temp=installed) as started:
+        (started.work / inmaya.STARTUP).write_text(
+            "Traceback (most recent call last):\n  no_such_plugin", encoding="utf-8"
+        )
+        with pytest.raises(session.StartError, match=r"(?s)dcc-mcp failed to load in Maya:\nTraceback.*no_such_plugin"):
+            started.wait(60)
+
+
+def test_wait_ends_when_the_server_answers_or_maya_exits(installed: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    answers = iter([False, True])
+    monkeypatch.setattr(session.transport, "healthy", lambda url: next(answers))
+    monkeypatch.setattr(session, "STARTUP_POLL", 0)
+    connected: list[object] = []
+    monkeypatch.setattr(session.call, "connect", lambda url, timeout, **kwargs: connected.append(kwargs["work"]))
+    with session.start(STARTED, temp=installed) as started:
+        started.wait(60)
+        assert connected == [started.work]
+        monkeypatch.setattr(session.transport, "healthy", lambda url: False)
+        started.maya.closed = True  # type: ignore[attr-defined]
+        with pytest.raises(session.StartError, match="Maya exited before its dcc-mcp server started"):
+            started.wait(60)
+
+
+def test_wait_out_of_time_shows_how_far_maya_got(installed: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(session.transport, "healthy", lambda url: False)
+    with session.start(STARTED, temp=installed) as started:
+        (started.work / inmaya.STARTUP).write_text("userSetup.py loaded", encoding="utf-8")
+        (started.work / session.BOOTSTRAP_LOG).write_text('{"step": "import"}', encoding="utf-8")
+        with pytest.raises(session.StartError, match=r'after 0 s; userSetup.py loaded; dcc-mcp bootstrap:\n\{"step"'):
+            started.wait(0)
+
+
+def test_execute_is_a_marked_call(installed: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`last_call` for the idle timer, `in_call` for `status` while the call runs, a watch for dialogs."""
+    seen: list[object] = []
+
+    def execute(url: str, code: str, timeout: float, watch: object = None) -> session.transport.Result:
+        seen.extend([session.call.activity(started.work, 0)[0], watch])
+        return session.transport.Result(True)
+
+    monkeypatch.setattr(session.transport, "execute", execute)
+    with session.start(STARTED, temp=installed) as started:
+        last_call = started.work / inmaya.LAST_CALL
+        last_call.unlink(missing_ok=True)
+        assert started.execute("1", 1).success
+        assert last_call.is_file()
+        assert session.call.activity(started.work, 0)[0] is None
+    busy, watch = seen
+    assert busy is not None and callable(watch)
 
 
 def test_release_keeps_the_maya_and_the_directory(installed: Path) -> None:
@@ -332,26 +309,20 @@ def test_release_keeps_the_maya_and_the_directory(installed: Path) -> None:
     assert session_dirs(installed) == [started.root]
 
 
-@pytest.mark.parametrize("record", [True, False])
-def test_record_writes_state(installed: Path, record: bool) -> None:
-    with session.start(STARTED, temp=installed, ttl=5, record=record) as started:
-        state = session.read_state(started.root)
-        if record:
-            assert state is not None
-            expected = State(PROJECT, str(STARTED.project_root), os.getpid(), 4242, started.url, state.started, 5, 7)
-            assert state == expected
-        else:
-            assert not (started.root / session.STATE_FILE).exists()
+def test_release_writes_state(installed: Path) -> None:
+    """Only a released Maya outlives its harness: only it has a `state.json` to be found by."""
+    with session.start(STARTED, temp=installed, ttl=5, command="start") as started:
+        assert not (started.root / registry.STATE_FILE).exists()
+        started.release()
+        state = registry.read_state(started.root)
+        assert state == State(PROJECT, str(STARTED.project_root), 4242, started.url, state.started, 5, 7)
 
 
-def test_execute_touches_last_call(installed: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(session.transport, "execute", lambda url, code, timeout: session.transport.Result(True))
+def test_a_session_of_run_writes_no_state(installed: Path) -> None:
     with session.start(STARTED, temp=installed) as started:
-        last_call = started.work / "last_call"
-        last_call.touch()
-        os.utime(last_call, (NOW, NOW))
-        assert started.execute("1", 1).success
-        assert last_call.stat().st_mtime > NOW
+        holder = json.loads((slots.DIR / "slot-1.holder").read_text(encoding="utf-8"))
+        assert holder["command"] == "run"
+    assert not (started.root / registry.STATE_FILE).exists()
 
 
 def slot_free() -> bool:
@@ -388,7 +359,7 @@ def test_a_maya_that_cannot_take_the_slot_is_closed_and_the_slot_freed(
             closed.append(self)
 
     monkeypatch.setattr(session.process, "MayaProcess", Maya)
-    monkeypatch.setattr(session.process, "give", GIVE)  # the fake Maya has no process: it fails
+    monkeypatch.setattr(win32, "give", GIVE)  # the fake Maya has no process: it fails
     with pytest.raises(OSError):
         session.start(STARTED, temp=installed)
     assert len(closed) == 1
@@ -406,19 +377,14 @@ def test_start_gives_up_when_no_slot_comes_free(installed: Path, monkeypatch: py
 
 
 def test_start_names_the_holder_of_its_slot(installed: Path) -> None:
-    with session.start(STARTED, temp=installed, record=True) as started:
-        holder = json.loads((slots.DIR / "slot-1.holder").read_text(encoding="utf-8"))
+    """The slots are shared by every version: the keys are the ones they all read. A Maya of `start`
+    shows `start` while it starts, and `release` does not write the holder again."""
+    holder_file = slots.DIR / "slot-1.holder"
+    with session.start(STARTED, temp=installed, command="start") as started:
+        holder = json.loads(holder_file.read_text(encoding="utf-8"))
+        written = holder_file.stat().st_mtime_ns
+        started.release()
+        assert holder_file.stat().st_mtime_ns == written
+    assert sorted(holder) == ["command", "created", "pid", "project", "time", "url", "work"]
     assert holder["pid"] == 4242 and holder["created"] == 7 and holder["command"] == "start"
     assert (holder["project"], holder["url"], holder["work"]) == (PROJECT, started.url, str(started.work))
-
-
-def test_watcher_cuts_a_call_short_only_on_a_modal_dialog(monkeypatch: pytest.MonkeyPatch) -> None:
-    dialog: list[str] = []
-    monkeypatch.setattr(process, "modal_dialog", lambda pid, desktop=None: dialog)
-    watch = session.watcher(10, "http://127.0.0.1:1/mcp")
-    watch()
-    dialog.append("Untrusted Plugin Loading - Security Warning")
-    with pytest.raises(session.transport.CallAborted) as raised:
-        watch()
-    assert "Maya 10 shows a modal dialog: ['Untrusted Plugin Loading - Security Warning']" in str(raised.value)
-    assert "maya-harness stop http://127.0.0.1:1/mcp" in str(raised.value)
