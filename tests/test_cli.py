@@ -247,6 +247,14 @@ def test_a_slot_wait_below_0_is_refused(capsys: pytest.CaptureFixture[str], comm
     assert cli.parser().parse_args([*command, "--slot-wait", "0"]).slot_wait == 0
 
 
+@pytest.mark.parametrize("value", ["0", "-5", "nan", "86401", "inf"])
+def test_exec_refuses_a_timeout_a_socket_cannot_take(capsys: pytest.CaptureFixture[str], value: str) -> None:
+    with pytest.raises(SystemExit):
+        cli.parser().parse_args(["exec", "-c", "1", "--timeout", value])
+    assert "takes more than 0 and at most 86400 seconds" in capsys.readouterr().err
+    assert cli.parser().parse_args(["exec", "-c", "1", "--timeout", "86400"]).timeout == 86400
+
+
 DIALOG = "Untrusted Plugin Loading - Security Warning"
 
 
@@ -313,3 +321,39 @@ def test_status_tells_a_running_call_from_idleness_and_shows_the_windows(
     assert cli.main(["status", "--json"]) == cli.OK
     row = json.loads(capsys.readouterr().out)[0]
     assert 539 <= row["busy"] <= 541 and row["windows"] == [DIALOG, "untitled - Autodesk MAYA"]
+
+
+def test_exec_waits_its_timeout_and_shows_signs_of_life(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """stderr even with --json: stdout stays one JSON line."""
+    from maya_harness import process
+
+    now = [0.0]
+    timeouts: list[float] = []
+
+    def connect(url: str, timeout: float, expected: Path | None = None, watch: transport.Watch | None = None) -> Path:
+        timeouts.append(timeout)
+        return tmp_path / "work"
+
+    def execute(url: str, code: str, timeout: float, watch: transport.Watch | None = None) -> transport.Result:
+        timeouts.append(timeout)
+        assert watch is not None
+        watch()
+        now[0] += cli.HEARTBEAT
+        watch()
+        return transport.Result(True, output="2")
+
+    target = Record(tmp_path, State("p", str(tmp_path), 1, 10, "http://127.0.0.1:1/mcp", time.time()))
+    (tmp_path / "work").mkdir()
+    monkeypatch.setattr(cli, "select", lambda url: (target.state.url, target))
+    monkeypatch.setattr(cli.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(process, "modal_dialog", lambda pid, desktop=None: [])
+    monkeypatch.setattr(process, "window_titles", lambda pid: ["untitled - Autodesk MAYA"])
+    monkeypatch.setattr(transport, "connect", connect)
+    monkeypatch.setattr(transport, "execute", execute)
+    assert cli.main(["exec", "-c", "1+1", "--timeout", "5", "--json"]) == cli.OK
+    assert timeouts == [5, 5]
+    out, err = capsys.readouterr()
+    assert json.loads(out)["output"] == "2"
+    assert err == f"waiting for Maya 10: {cli.HEARTBEAT} s, windows [untitled - Autodesk MAYA]\n"

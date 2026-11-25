@@ -26,7 +26,9 @@ from . import config, process, session, slots, transport
 from . import run as scenario_run
 from .session import Record
 
-CALL_TIMEOUT = 900  # seconds per `exec`
+CALL_TIMEOUT = 900  # seconds per `exec`, by default
+MAX_CALL_TIMEOUT = 86400  # a day: a longer wait is a typo, and past 2147483 s the socket overflows
+HEARTBEAT = 30  # seconds between the signs of life of an `exec` that waits for Maya
 DEFAULT_TTL = 60  # minutes
 PATCH_VARIABLE = "MAYA_HARNESS_DCC_MCP_PATCH"
 
@@ -40,7 +42,16 @@ def seconds(text: str) -> float:
     return value
 
 
-# Not --timeout: that would read as the time of a call.
+def call_seconds(text: str) -> float:
+    """The time of a call: a socket with timeout 0 is non-blocking, and connect fails with
+    WinError 10035; above 2147483 s (INT_MAX ms) `settimeout` raises OverflowError."""
+    value = float(text)
+    if not 0 < value <= MAX_CALL_TIMEOUT:
+        raise argparse.ArgumentTypeError(f"{text}: takes more than 0 and at most {MAX_CALL_TIMEOUT} seconds")
+    return value
+
+
+# Not --timeout: this is the wait for a slot, not the time of a call.
 SLOT_WAIT: dict[str, Any] = {
     "type": seconds,
     "metavar": "SEC",
@@ -88,6 +99,13 @@ def parser() -> argparse.ArgumentParser:
     )
     code.add_argument("-f", dest="file", type=Path, metavar="FILE", help="the code from a file")
     run.add_argument("--reload", action="store_true", help="drop the project's packages from sys.modules first")
+    run.add_argument(
+        "--timeout",
+        type=call_seconds,
+        default=CALL_TIMEOUT,
+        metavar="SEC",
+        help=f"give up waiting for the reply after this long, {CALL_TIMEOUT} by default",
+    )
     run.add_argument("--json", action="store_true")
 
     scenarios = commands.add_parser(
@@ -178,24 +196,41 @@ def reload_code(packages: Sequence[str]) -> str:
     )
 
 
+def heartbeat(pid: int, watch: transport.Watch) -> transport.Watch:
+    """`watch`, and every `HEARTBEAT` seconds a line on stderr: a long call is not taken for a hung
+    one. stderr with `--json` too: stdout stays one JSON line."""
+    begin = time.monotonic()
+    beaten = [begin]
+
+    def beat() -> None:
+        watch()
+        now = time.monotonic()
+        if now - beaten[0] >= HEARTBEAT:
+            beaten[0] = now
+            titles = ", ".join(process.window_titles(pid))
+            print(f"waiting for Maya {pid}: {round(now - begin)} s, windows [{titles}]", file=sys.stderr, flush=True)
+
+    return beat
+
+
 def run(args: argparse.Namespace) -> int:
     code = args.code if args.code is not None else args.file.read_text(encoding="utf-8")
     url, target = select(args.url)
     packages = config.load(Path.cwd()).reload if args.reload else ()
     # Only a Maya of a session: the pid of a Maya at a foreign address is unknown.
-    watch = session.watcher(target.state.maya_pid, url) if target else None
+    watch = heartbeat(target.state.maya_pid, session.watcher(target.state.maya_pid, url)) if target else None
     # A connect cut short on a dialog is a TransportError out of `main`: the code was not sent.
-    work = transport.connect(url, CALL_TIMEOUT, target.work if target else None, watch)
+    work = transport.connect(url, args.timeout, target.work if target else None, watch)
     session.touch(work)
     slots.begin_call(work)
     try:
         # A call of its own, not a prefix of the code: `from __future__` must open the code, and
         # the line numbers of its traceback must be the file's.
         result = (
-            transport.execute(url, reload_code(packages), CALL_TIMEOUT, watch) if packages else transport.Result(True)
+            transport.execute(url, reload_code(packages), args.timeout, watch) if packages else transport.Result(True)
         )
         if result.success:
-            result = transport.execute(url, code, CALL_TIMEOUT, watch)
+            result = transport.execute(url, code, args.timeout, watch)
     except OSError as error:  # a timeout, a reset: the code reached Maya and may have run
         result = transport.Result(False, type(error).__name__, stderr=f"no reply from {url}: {error}")
     except transport.CallAborted as error:  # the code reached Maya and runs on after the dialog
