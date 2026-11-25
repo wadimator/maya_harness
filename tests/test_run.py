@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from maya_harness import cli, config, session, slots
+from maya_harness import cli, config, session, slots, win32
 from maya_harness import run as scenario_run
 from maya_harness.run import Run
 
@@ -186,7 +186,7 @@ def installed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     (tmp_path / "x.mod").write_text("+ MAYAVERSION:2025 PLATFORM:win64 dcc_mcp_maya 1 C:/m\n", encoding="utf-8")
     monkeypatch.setenv("MAYAPY_EXE", str(tmp_path / "mayapy.exe"))
     monkeypatch.setenv(session.MODULE_VARIABLE, str(tmp_path / "x.mod"))
-    monkeypatch.setattr(session.process, "give", lambda *_: None)  # a fake Maya has no process to hold a slot
+    monkeypatch.setattr(win32, "give", lambda *_: None)  # a fake Maya has no process to hold a slot
 
 
 def test_run_removes_the_session_of_a_maya_that_failed_to_start(
@@ -391,7 +391,7 @@ def test_run_json_with_every_slot_taken_keeps_stdout_one_json_line(
     assert "maya1: all 1 Maya slots stayed taken for 5 s" in err
 
 
-GIVE = session.process.give  # the real one: `installed` replaces it
+GIVE = win32.give  # the real one: `installed` replaces it
 PROCESS_ALL_ACCESS = 0x1FFFFF
 
 
@@ -407,7 +407,7 @@ def test_run_ends_once_no_run_is_left_though_a_maya_still_waits_for_a_slot(
     from maya_harness import slots
 
     monkeypatch.setenv(slots.VARIABLE, "2")
-    monkeypatch.setattr(session.process, "give", GIVE)  # stubs are real processes: they hold the slot
+    monkeypatch.setattr(win32, "give", GIVE)  # stubs are real processes: they hold the slot
     outside = [slots.take(0)]
     grabbed = threading.Event()
 
@@ -417,7 +417,7 @@ def test_run_ends_once_no_run_is_left_though_a_maya_still_waits_for_a_slot(
             self.pid = self.child.pid
             self.created = 0
             self.desktop = None
-            self.handle = session.process.kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, self.pid)
+            self.handle = win32.kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, self.pid)
 
         def running(self) -> bool:
             return self.child.poll() is None
@@ -426,7 +426,7 @@ def test_run_ends_once_no_run_is_left_though_a_maya_still_waits_for_a_slot(
             if self.child.poll() is None:
                 self.child.kill()
                 self.child.wait(5)
-                session.process.kernel32.CloseHandle(self.handle)
+                win32.kernel32.CloseHandle(self.handle)
                 if not grabbed.is_set():  # another harness takes the freed slot
                     taken = slots.try_take()
                     assert taken is not None

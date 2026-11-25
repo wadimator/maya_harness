@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from maya_harness import process, slots
+from maya_harness import slots, win32
 
 Stub = Callable[..., subprocess.Popen[str]]
 HOLD = "import sys; sys.stdin.readline()"  # a holder that lives until told
@@ -93,14 +93,14 @@ def test_a_slot_is_free_once_its_holder_exits_though_its_child_lives(
     holder.stdin.write("\n")
     holder.stdin.flush()
     pid = int(holder.stdout.readline())
-    grandchild = process.kernel32.OpenProcess(process.PROCESS_TERMINATE | process.SYNCHRONIZE, False, pid)
+    grandchild = win32.kernel32.OpenProcess(win32.PROCESS_TERMINATE | win32.SYNCHRONIZE, False, pid)
     try:
         assert holder.wait(5) == 0
-        assert process.kernel32.WaitForSingleObject(grandchild, 0) == process.WAIT_TIMEOUT  # alive
+        assert win32.kernel32.WaitForSingleObject(grandchild, 0) == win32.WAIT_TIMEOUT  # alive
         assert free(own_slots)
     finally:
-        process.kernel32.TerminateProcess(grandchild, 1)
-        process.kernel32.CloseHandle(grandchild)
+        win32.kernel32.TerminateProcess(grandchild, 1)
+        win32.kernel32.CloseHandle(grandchild)
 
 
 def test_a_failed_give_frees_the_slot(own_slots: Path, monkeypatch: pytest.MonkeyPatch) -> None:

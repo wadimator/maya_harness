@@ -2,7 +2,7 @@
 
 * `count()` slots, files `slot-<n>` in `DIR`. A slot is taken by a handle of its file opened
   with no sharing: an open by anyone else fails with a sharing violation. The harness copies the
-  handle into Maya (`process.give`) and closes its own, so Maya holds the slot, and Windows
+  handle into Maya (`win32.give`) and closes its own, so Maya holds the slot, and Windows
   closes the handle when Maya dies, however it dies: a kill, a crash, its idle timer, the job of
   a killed harness. A slot is never left taken by nobody.
 * The handle is opened for reading: an open with access 0 does not check the share mode, so a
@@ -36,31 +36,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import process
-from .process import kernel32
+from . import process, win32
 
 DIR = Path(tempfile.gettempdir()) / "maya_harness" / "slots"
 VARIABLE = "MAYA_HARNESS_SLOTS"
 DEFAULT_COUNT = 4  # more than 4 Mayas on 8 cores / 16 threads slow each other down (Retarget_Master)
 POLL = 0.5  # seconds between the tries of a harness that waits for a slot
 REMINDER = 60  # seconds between the lines of a harness that still waits
-
-GENERIC_READ = 0x80000000
-OPEN_ALWAYS = 4
-FILE_ATTRIBUTE_NORMAL = 0x80
-ERROR_SHARING_VIOLATION = 32
-INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
-
-kernel32.CreateFileW.restype = ctypes.c_void_p
-kernel32.CreateFileW.argtypes = [
-    ctypes.c_wchar_p,
-    ctypes.c_uint32,
-    ctypes.c_uint32,
-    ctypes.c_void_p,
-    ctypes.c_uint32,
-    ctypes.c_uint32,
-    ctypes.c_void_p,
-]
 
 
 class NoSlot(Exception):
@@ -80,13 +62,13 @@ class Slot:
         is closed either way: on an error the slot is free again."""
         assert self.handle is not None
         try:
-            process.give(self.handle, owner)
+            win32.give(self.handle, owner)
         finally:
             self.release()
 
     def release(self) -> None:
         if self.handle is not None:
-            kernel32.CloseHandle(self.handle)
+            win32.kernel32.CloseHandle(self.handle)
             self.handle = None
 
     def describe(self, holder: dict[str, Any]) -> None:
@@ -113,10 +95,12 @@ def holder_file(path: Path) -> Path:
 
 def open_slot(path: Path) -> int | None:
     """A handle of the slot file with no sharing; None when the slot is taken."""
-    handle = kernel32.CreateFileW(str(path), GENERIC_READ, 0, None, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, None)
-    if handle is None or handle == INVALID_HANDLE_VALUE:
+    handle = win32.kernel32.CreateFileW(
+        str(path), win32.GENERIC_READ, 0, None, win32.OPEN_ALWAYS, win32.FILE_ATTRIBUTE_NORMAL, None
+    )
+    if handle is None or handle == win32.INVALID_HANDLE_VALUE:
         error = ctypes.get_last_error()
-        if error == ERROR_SHARING_VIOLATION:
+        if error == win32.ERROR_SHARING_VIOLATION:
             return None
         raise ctypes.WinError(error)
     return int(handle)
@@ -196,7 +180,7 @@ def holders(directory: Path | None = None) -> list[Holder]:
             continue
         handle = open_slot(path)  # for reading: an open with access 0 succeeds on a taken slot too
         if handle is not None:  # free
-            kernel32.CloseHandle(handle)
+            win32.kernel32.CloseHandle(handle)
             continue
         found.append(read_holder(number, path))
     return found

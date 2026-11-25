@@ -5,13 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from maya_harness import process, session, slots
+from maya_harness import process, session, slots, win32
 from maya_harness.session import SessionParams, State
 
 PROJECT = "Retarget_Master"  # `_` in the name: the directory name cannot be split into a pid
 DEAD, ALIVE, OTHER_ALIVE = 101, 202, 303
 NOW = 1_000_000_000.0
-GIVE = process.give  # the real one: `installed` replaces it
+GIVE = win32.give  # the real one: `installed` replaces it
 
 
 def alive(pid: int) -> bool:
@@ -267,7 +267,7 @@ def installed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     monkeypatch.setenv("MAYAPY_EXE", str(tmp_path / "mayapy.exe"))
     monkeypatch.setenv(session.MODULE_VARIABLE, str(tmp_path / "dcc_mcp_maya.mod"))
     monkeypatch.setattr(session.process, "MayaProcess", FakeMaya)
-    monkeypatch.setattr(session.process, "give", lambda *_: None)  # a fake Maya has no process to hold a slot
+    monkeypatch.setattr(win32, "give", lambda *_: None)  # a fake Maya has no process to hold a slot
     monkeypatch.setattr(session.transport, "server_logs", lambda pid: [])
     temp = tmp_path / "temp"
     temp.mkdir()
@@ -388,7 +388,7 @@ def test_a_maya_that_cannot_take_the_slot_is_closed_and_the_slot_freed(
             closed.append(self)
 
     monkeypatch.setattr(session.process, "MayaProcess", Maya)
-    monkeypatch.setattr(session.process, "give", GIVE)  # the fake Maya has no process: it fails
+    monkeypatch.setattr(win32, "give", GIVE)  # the fake Maya has no process: it fails
     with pytest.raises(OSError):
         session.start(STARTED, temp=installed)
     assert len(closed) == 1

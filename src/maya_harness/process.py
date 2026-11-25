@@ -12,8 +12,7 @@
   `SPARED_CPUS` of them: the PC stays usable while Maya works.
 * Maya is created suspended and put in the job before its first instruction: nothing it starts
   can escape the job.
-* Windows only, through `ctypes`: every handle has its `argtypes` and `restype`, or ctypes
-  passes it as a 32-bit int and cuts it on x64.
+* Windows only: the Win32 API is in `win32`.
 """
 
 from __future__ import annotations
@@ -25,164 +24,14 @@ import threading
 from ctypes import wintypes
 from pathlib import Path
 
+from . import win32
+
 EXIT_TIMEOUT = 60  # seconds for a killed Maya to exit
 SPARED_CPUS = 4  # the first logical CPUs, left to the user's own work while Maya runs
 SPARE_FROM = 8  # logical CPUs; on fewer, Maya gets all of them
 
-user32 = ctypes.WinDLL("user32", use_last_error=True)
-kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-
-CREATE_SUSPENDED = 0x4
-CREATE_UNICODE_ENVIRONMENT = 0x400
-GENERIC_ALL = 0x10000000
-PROCESS_TERMINATE = 0x1
-PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-SYNCHRONIZE = 0x100000
-WAIT_TIMEOUT = 0x102
-JOB_OBJECT_LIMIT_AFFINITY = 0x10
-JOB_OBJECT_LIMIT_PRIORITY_CLASS = 0x20
-JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
-BELOW_NORMAL_PRIORITY_CLASS = 0x4000
-JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9
-DUPLICATE_SAME_ACCESS = 0x2
-DESKTOP_READOBJECTS = 0x1
-DESKTOP_ENUMERATE = 0x40
 DESKTOP_PREFIX = "maya_harness_"
 MAIN_TITLE = "Autodesk MAYA"  # in the title of Maya's main window: "untitled - Autodesk MAYA 2025.3.1: untitled"
-
-
-class STARTUPINFOW(ctypes.Structure):
-    _fields_ = [
-        ("cb", wintypes.DWORD),
-        ("lpReserved", wintypes.LPWSTR),
-        ("lpDesktop", wintypes.LPWSTR),
-        ("lpTitle", wintypes.LPWSTR),
-        ("dwX", wintypes.DWORD),
-        ("dwY", wintypes.DWORD),
-        ("dwXSize", wintypes.DWORD),
-        ("dwYSize", wintypes.DWORD),
-        ("dwXCountChars", wintypes.DWORD),
-        ("dwYCountChars", wintypes.DWORD),
-        ("dwFillAttribute", wintypes.DWORD),
-        ("dwFlags", wintypes.DWORD),
-        ("wShowWindow", wintypes.WORD),
-        ("cbReserved2", wintypes.WORD),
-        ("lpReserved2", ctypes.c_void_p),
-        ("hStdInput", wintypes.HANDLE),
-        ("hStdOutput", wintypes.HANDLE),
-        ("hStdError", wintypes.HANDLE),
-    ]
-
-
-class PROCESS_INFORMATION(ctypes.Structure):
-    _fields_ = [
-        ("hProcess", wintypes.HANDLE),
-        ("hThread", wintypes.HANDLE),
-        ("dwProcessId", wintypes.DWORD),
-        ("dwThreadId", wintypes.DWORD),
-    ]
-
-
-class IO_COUNTERS(ctypes.Structure):
-    _fields_ = [(name, ctypes.c_ulonglong) for name in ("Read", "Write", "Other")] + [
-        (f"{name}TransferCount", ctypes.c_ulonglong) for name in ("Read", "Write", "Other")
-    ]
-
-
-class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
-    _fields_ = [
-        ("PerProcessUserTimeLimit", ctypes.c_longlong),
-        ("PerJobUserTimeLimit", ctypes.c_longlong),
-        ("LimitFlags", wintypes.DWORD),
-        ("MinimumWorkingSetSize", ctypes.c_size_t),
-        ("MaximumWorkingSetSize", ctypes.c_size_t),
-        ("ActiveProcessLimit", wintypes.DWORD),
-        ("Affinity", ctypes.c_size_t),
-        ("PriorityClass", wintypes.DWORD),
-        ("SchedulingClass", wintypes.DWORD),
-    ]
-
-
-class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
-    _fields_ = [
-        ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
-        ("IoInfo", IO_COUNTERS),
-        ("ProcessMemoryLimit", ctypes.c_size_t),
-        ("JobMemoryLimit", ctypes.c_size_t),
-        ("PeakProcessMemoryUsed", ctypes.c_size_t),
-        ("PeakJobMemoryUsed", ctypes.c_size_t),
-    ]
-
-
-user32.CreateDesktopW.restype = wintypes.HANDLE
-user32.CreateDesktopW.argtypes = [
-    wintypes.LPCWSTR,
-    wintypes.LPCWSTR,
-    ctypes.c_void_p,
-    wintypes.DWORD,
-    wintypes.DWORD,
-    ctypes.c_void_p,
-]
-user32.CloseDesktop.argtypes = [wintypes.HANDLE]
-user32.GetThreadDesktop.restype = wintypes.HANDLE
-user32.GetThreadDesktop.argtypes = [wintypes.DWORD]
-kernel32.CreateJobObjectW.restype = wintypes.HANDLE
-kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
-kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
-kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
-kernel32.CreateProcessW.argtypes = [
-    wintypes.LPCWSTR,
-    wintypes.LPWSTR,
-    ctypes.c_void_p,
-    ctypes.c_void_p,
-    wintypes.BOOL,
-    wintypes.DWORD,
-    ctypes.c_void_p,
-    wintypes.LPCWSTR,
-    ctypes.POINTER(STARTUPINFOW),
-    ctypes.POINTER(PROCESS_INFORMATION),
-]
-WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-user32.EnumDesktopWindows.argtypes = [wintypes.HANDLE, WNDENUMPROC, wintypes.LPARAM]
-user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
-user32.IsWindowVisible.argtypes = [wintypes.HWND]
-user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
-user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
-user32.IsWindowEnabled.argtypes = [wintypes.HWND]
-DESKENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.LPWSTR, wintypes.LPARAM)
-user32.GetProcessWindowStation.restype = wintypes.HANDLE
-user32.EnumDesktopsW.argtypes = [wintypes.HANDLE, DESKENUMPROC, wintypes.LPARAM]
-user32.OpenDesktopW.restype = wintypes.HANDLE
-user32.OpenDesktopW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-kernel32.OpenProcess.restype = wintypes.HANDLE
-kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
-kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE, *[ctypes.POINTER(wintypes.FILETIME)] * 4]
-kernel32.QueryFullProcessImageNameW.argtypes = [
-    wintypes.HANDLE,
-    wintypes.DWORD,
-    wintypes.LPWSTR,
-    ctypes.POINTER(wintypes.DWORD),
-]
-kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
-kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-kernel32.DuplicateHandle.argtypes = [
-    wintypes.HANDLE,
-    wintypes.HANDLE,
-    wintypes.HANDLE,
-    ctypes.POINTER(wintypes.HANDLE),
-    wintypes.DWORD,
-    wintypes.BOOL,
-    wintypes.DWORD,
-]
-
-
-def _checked(result: object) -> object:
-    if not result:
-        raise ctypes.WinError(ctypes.get_last_error())
-    return result
 
 
 def affinity_mask(cpus: int, spared: int = SPARED_CPUS) -> int:
@@ -209,55 +58,57 @@ class MayaProcess:
     `close` or `release`."""
 
     def __init__(self, maya: Path, env: dict[str, str], visible: bool = False, number: int = 1) -> None:
-        startup = STARTUPINFOW(cb=ctypes.sizeof(STARTUPINFOW))
+        startup = win32.STARTUPINFOW(cb=ctypes.sizeof(win32.STARTUPINFOW))
         self.desktop = None
         if not visible:
             name = f"{DESKTOP_PREFIX}{os.getpid()}_{number}"
-            self.desktop = _checked(user32.CreateDesktopW(name, None, None, 0, GENERIC_ALL, None))
+            self.desktop = win32.checked(win32.user32.CreateDesktopW(name, None, None, 0, win32.GENERIC_ALL, None))
             startup.lpDesktop = f"WinSta0\\{name}"
-        self.job = _checked(kernel32.CreateJobObjectW(None, None))
+        self.job = win32.checked(win32.kernel32.CreateJobObjectW(None, None))
         self.closed = False
         self._lock = threading.Lock()
         affinity = affinity_mask(os.cpu_count() or 1)
-        flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_PRIORITY_CLASS
-        self._set_job_limits(flags | (JOB_OBJECT_LIMIT_AFFINITY if affinity else 0), affinity)
+        flags = win32.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | win32.JOB_OBJECT_LIMIT_PRIORITY_CLASS
+        self._set_job_limits(flags | (win32.JOB_OBJECT_LIMIT_AFFINITY if affinity else 0), affinity)
 
-        process = PROCESS_INFORMATION()
+        process = win32.PROCESS_INFORMATION()
         block = environment_block(env)
         environment = ctypes.create_unicode_buffer(block, len(block))
         command = ctypes.create_unicode_buffer(subprocess.list2cmdline([str(maya), "-hideConsole"]))
-        flags = CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT
-        _checked(
-            kernel32.CreateProcessW(
+        flags = win32.CREATE_SUSPENDED | win32.CREATE_UNICODE_ENVIRONMENT
+        win32.checked(
+            win32.kernel32.CreateProcessW(
                 None, command, None, None, False, flags, environment, None, ctypes.byref(startup), ctypes.byref(process)
             )
         )
         self.handle, self.pid = process.hProcess, int(process.dwProcessId)
-        self.created = creation_time(self.handle)
-        _checked(kernel32.AssignProcessToJobObject(self.job, self.handle))
-        kernel32.ResumeThread(process.hThread)
-        kernel32.CloseHandle(process.hThread)
+        self.created = win32.creation_time(self.handle)
+        win32.checked(win32.kernel32.AssignProcessToJobObject(self.job, self.handle))
+        win32.kernel32.ResumeThread(process.hThread)
+        win32.kernel32.CloseHandle(process.hThread)
 
     def _set_job_limits(self, flags: int, affinity: int = 0) -> None:
-        limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        limits = win32.JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
         limits.BasicLimitInformation.LimitFlags = flags
         limits.BasicLimitInformation.Affinity = affinity
-        limits.BasicLimitInformation.PriorityClass = BELOW_NORMAL_PRIORITY_CLASS
-        _checked(
-            kernel32.SetInformationJobObject(
-                self.job, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS, ctypes.byref(limits), ctypes.sizeof(limits)
+        limits.BasicLimitInformation.PriorityClass = win32.BELOW_NORMAL_PRIORITY_CLASS
+        win32.checked(
+            win32.kernel32.SetInformationJobObject(
+                self.job, win32.JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS, ctypes.byref(limits), ctypes.sizeof(limits)
             )
         )
 
     def running(self) -> bool:
-        return bool(kernel32.WaitForSingleObject(self.handle, 0) != 0)
+        return bool(win32.kernel32.WaitForSingleObject(self.handle, 0) != 0)
 
     def wait(self, timeout: float) -> bool:
-        return bool(kernel32.WaitForSingleObject(self.handle, int(timeout * 1000)) == 0)
+        return bool(win32.kernel32.WaitForSingleObject(self.handle, int(timeout * 1000)) == 0)
 
     def window_titles(self) -> list[str]:
         """Maya's visible windows: on the hidden desktop a modal dialog is seen only this way."""
-        return window_titles(self.pid, self.desktop or user32.GetThreadDesktop(kernel32.GetCurrentThreadId()))
+        return window_titles(
+            self.pid, self.desktop or win32.user32.GetThreadDesktop(win32.kernel32.GetCurrentThreadId())
+        )
 
     def close(self) -> None:
         """Kills whatever is still running in the job, then lets go of the desktop. Once."""
@@ -265,7 +116,7 @@ class MayaProcess:
             if self.closed:
                 return
             self.closed = True
-            kernel32.CloseHandle(self.job)
+            win32.kernel32.CloseHandle(self.job)
             self.wait(EXIT_TIMEOUT)
             self._close_handles()
 
@@ -276,15 +127,15 @@ class MayaProcess:
         with self._lock:
             self.closed = True
             try:
-                give(self.job, self.handle)
+                win32.give(self.job, self.handle)
             finally:
-                kernel32.CloseHandle(self.job)
+                win32.kernel32.CloseHandle(self.job)
                 self._close_handles()
 
     def _close_handles(self) -> None:
-        kernel32.CloseHandle(self.handle)
+        win32.kernel32.CloseHandle(self.handle)
         if self.desktop:
-            user32.CloseDesktop(self.desktop)
+            win32.user32.CloseDesktop(self.desktop)
 
 
 def window_titles(pid: int, desktop: object = None) -> list[str]:
@@ -305,7 +156,7 @@ def modal_dialog(pid: int, desktop: object = None) -> list[str]:
     with no other titled one is [] too, and the next look finds the dialog with its title."""
     windows = _windows(pid, desktop)
     main = [window for window, title in windows if MAIN_TITLE in title]
-    if not main or any(user32.IsWindowEnabled(window) for window in main):
+    if not main or any(win32.user32.IsWindowEnabled(window) for window in main):
         return []
     return [title for window, title in windows if window not in main]
 
@@ -321,13 +172,13 @@ def _windows(pid: int, desktop: object) -> list[tuple[int, str]]:
             names.append(name)
         return True
 
-    user32.EnumDesktopsW(user32.GetProcessWindowStation(), DESKENUMPROC(collect), 0)
-    titles = _titles_on(user32.GetThreadDesktop(kernel32.GetCurrentThreadId()), pid)
+    win32.user32.EnumDesktopsW(win32.user32.GetProcessWindowStation(), win32.DESKENUMPROC(collect), 0)
+    titles = _titles_on(win32.user32.GetThreadDesktop(win32.kernel32.GetCurrentThreadId()), pid)
     for name in names:
-        handle = user32.OpenDesktopW(name, 0, False, DESKTOP_READOBJECTS | DESKTOP_ENUMERATE)
+        handle = win32.user32.OpenDesktopW(name, 0, False, win32.DESKTOP_READOBJECTS | win32.DESKTOP_ENUMERATE)
         if handle:  # closed since it was listed
             titles += _titles_on(handle, pid)
-            user32.CloseDesktop(handle)
+            win32.user32.CloseDesktop(handle)
     return titles
 
 
@@ -336,44 +187,15 @@ def _titles_on(desktop: object, pid: int) -> list[tuple[int, str]]:
 
     def collect(window: int, _: int) -> bool:
         owner = wintypes.DWORD()
-        user32.GetWindowThreadProcessId(window, ctypes.byref(owner))
-        if owner.value == pid and user32.IsWindowVisible(window) and user32.GetWindowTextLengthW(window):
+        win32.user32.GetWindowThreadProcessId(window, ctypes.byref(owner))
+        if owner.value == pid and win32.user32.IsWindowVisible(window) and win32.user32.GetWindowTextLengthW(window):
             title = ctypes.create_unicode_buffer(512)
-            user32.GetWindowTextW(window, title, len(title))
+            win32.user32.GetWindowTextW(window, title, len(title))
             titles.append((window, title.value))
         return True
 
-    user32.EnumDesktopWindows(desktop, WNDENUMPROC(collect), 0)
+    win32.user32.EnumDesktopWindows(desktop, win32.WNDENUMPROC(collect), 0)
     return titles
-
-
-def give(handle: object, owner: object) -> None:
-    """Copies `handle` into the process `owner`, not inheritable: what it holds lives while
-    `owner` does, and none of the processes `owner` starts holds it. The caller may close its own."""
-    copy = wintypes.HANDLE()
-    _checked(
-        kernel32.DuplicateHandle(
-            kernel32.GetCurrentProcess(), handle, owner, ctypes.byref(copy), 0, False, DUPLICATE_SAME_ACCESS
-        )
-    )
-
-
-def creation_time(handle: object) -> int:
-    """When the process was created, in 100 ns FILETIME units: with the pid, it names the process."""
-    created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
-    _checked(
-        kernel32.GetProcessTimes(
-            handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)
-        )
-    )
-    return (created.dwHighDateTime << 32) | created.dwLowDateTime
-
-
-def image_name(handle: object) -> str:
-    size = wintypes.DWORD(32768)
-    name = ctypes.create_unicode_buffer(size.value)
-    _checked(kernel32.QueryFullProcessImageNameW(handle, 0, name, ctypes.byref(size)))
-    return name.value
 
 
 def is_our_maya(image: str, created: int, recorded: int) -> bool:
@@ -384,47 +206,49 @@ def is_our_maya(image: str, created: int, recorded: int) -> bool:
 def kill_maya(pid: int, recorded: int) -> bool:
     """Kills our Maya `pid`; True once it is gone. Our Maya always opens for us: a pid that does
     not, or that names another process now, means it is gone already."""
-    handle = kernel32.OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, pid)
+    handle = win32.kernel32.OpenProcess(
+        win32.PROCESS_TERMINATE | win32.PROCESS_QUERY_LIMITED_INFORMATION | win32.SYNCHRONIZE, False, pid
+    )
     if not handle:
         return True
     try:
         try:
-            ours = is_our_maya(image_name(handle), creation_time(handle), recorded)
+            ours = is_our_maya(win32.image_name(handle), win32.creation_time(handle), recorded)
         except OSError:  # exited, though someone still holds a handle: no image name (WinError 31)
-            return bool(kernel32.WaitForSingleObject(handle, 0) == 0)
+            return bool(win32.kernel32.WaitForSingleObject(handle, 0) == 0)
         if not recorded:  # a state.json from before the creation time: cannot tell
             return False
         if not ours:
             return True  # the pid names another process now
-        kernel32.TerminateProcess(handle, 1)  # unchecked: a process already exiting refuses
-        return bool(kernel32.WaitForSingleObject(handle, EXIT_TIMEOUT * 1000) == 0)
+        win32.kernel32.TerminateProcess(handle, 1)  # unchecked: a process already exiting refuses
+        return bool(win32.kernel32.WaitForSingleObject(handle, EXIT_TIMEOUT * 1000) == 0)
     finally:
-        kernel32.CloseHandle(handle)
+        win32.kernel32.CloseHandle(handle)
 
 
 def maya_alive(pid: int, recorded: int) -> bool:
     """Our Maya `pid` still runs. Windows reuses pids: with a recorded creation time, a pid that
     names another process now is not our Maya; without one (an old state.json), the pid decides."""
-    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, pid)
+    handle = win32.kernel32.OpenProcess(win32.PROCESS_QUERY_LIMITED_INFORMATION | win32.SYNCHRONIZE, False, pid)
     if not handle:
         return False
     try:
-        if kernel32.WaitForSingleObject(handle, 0) != WAIT_TIMEOUT:
+        if win32.kernel32.WaitForSingleObject(handle, 0) != win32.WAIT_TIMEOUT:
             return False
         if not recorded:
             return True
         try:
-            return is_our_maya(image_name(handle), creation_time(handle), recorded)
+            return is_our_maya(win32.image_name(handle), win32.creation_time(handle), recorded)
         except OSError:
             return False
     finally:
-        kernel32.CloseHandle(handle)
+        win32.kernel32.CloseHandle(handle)
 
 
 def process_alive(pid: int) -> bool:
-    handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+    handle = win32.kernel32.OpenProcess(win32.SYNCHRONIZE, False, pid)
     if not handle:
         return False
-    alive = kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
-    kernel32.CloseHandle(handle)
+    alive = win32.kernel32.WaitForSingleObject(handle, 0) == win32.WAIT_TIMEOUT
+    win32.kernel32.CloseHandle(handle)
     return bool(alive)
