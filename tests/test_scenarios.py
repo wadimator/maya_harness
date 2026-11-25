@@ -80,6 +80,8 @@ def test_verdict(expected: str, failures: list[str] | None, result: tuple[bool, 
         (["check_bake", "control=no_round"], [Run("check_bake", {"control": "no_round"}, "film.whole_frames")]),
         (["check_bake", "control=nope"], [Run("check_bake", {"control": "nope"}, "")]),
         (["all"], ALL),
+        (["scenarios"], [ALL[0], ALL[2]]),
+        (["controls"], [ALL[1]]),
     ],
 )
 def test_parse(argv: list[str], runs: list[Run]) -> None:
@@ -91,6 +93,8 @@ def test_parse(argv: list[str], runs: list[Run]) -> None:
     [
         ["all", "section=film"],
         ["all", "control=no_round"],
+        ["scenarios", "section=film"],
+        ["controls", "control=no_round"],
         ["check_bake", "check_fps", "section=film"],
         ["check_bake", "check_fps", "control=no_round"],
     ],

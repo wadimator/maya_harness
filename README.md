@@ -8,8 +8,8 @@
 * `maya-harness exec -c "<код>"` — выполнить код в ней и напечатать результат;
 * `maya-harness status` — какие Maya запущены;
 * `maya-harness stop` — убить;
-* `maya-harness run <сценарии | all>` — прогнать сценарии проверок плагина в нескольких Maya
-  сразу ([docs/scenarios.md](docs/scenarios.md));
+* `maya-harness run <сценарии | all | scenarios | controls>` — прогнать сценарии проверок
+  плагина в нескольких Maya сразу ([docs/scenarios.md](docs/scenarios.md));
 * `maya-harness doctor` — готова ли машина.
 
 Код выполняется через [dcc-mcp-maya](https://github.com/dcc-mcp/dcc-mcp-maya), MCP-сервер внутри
@@ -62,7 +62,7 @@ reload = ["UE_exporter"]          # пакеты, которые exec --reload �
 
 [tool.maya_harness.scenarios]     # только для run; нужны оба ключа
 dir = "dev_tools/maya_checks"     # сценарии check_*.py
-runs = "dev_tools/maya_checks/runs.toml"  # таблица прогонов: что гонит run all
+runs = "dev_tools/maya_checks/runs.toml"  # таблица прогонов: что гонят run all, scenarios и controls
 ```
 
 `sys_path` и `plugins` запоминаются при `start`: правка настроек действует со следующего
@@ -76,7 +76,7 @@ runs = "dev_tools/maya_checks/runs.toml"  # таблица прогонов: ч�
 | `exec [URL] (-c КОД \| -f ФАЙЛ) [--reload] [--timeout СЕК] [--json]` | выполнить код; печатает stdout, stderr и значение последнего выражения, если код им кончается. `--timeout` — срок ожидания ответа, больше 0 и до 86400 с, 900 по умолчанию; пока ответа нет, раз в 30 с — признак жизни в stderr. Без URL — последняя запущенная Maya этого корня проекта (worktree — другой корень, своя Maya). `--reload` — сначала выгрузить пакеты из `reload` |
 | `status [--json]` | все Maya maya_harness этого пользователя: проект, pid, адрес, возраст, простой или идущий вызов (`busy`), окна Maya; в тексте ещё слоты машины и их держатели (`--json` — только сеансы) |
 | `stop [URL \| --project \| --all-mine]` | убить последнюю Maya этого проекта, Maya по адресу, все Maya проекта или все свои — сразу, если pid по-прежнему её; перед этим напечатать её простой или идущий вызов (`busy`) и заголовки окон (модальный диалог виден там), после — удалить каталог сеанса. Идущий в эту Maya вызов обрывается |
-| `run (СЦЕНАРИИ \| all) [ПАРАМЕТР=ЗНАЧЕНИЕ] [--jobs N] [--url URL] [--visible] [--slot-wait СЕК] [--json]` | прогнать сценарии в своих Maya (`--jobs`, 3 по умолчанию; Maya, не дождавшаяся слота за `--slot-wait`, выбывает) или по очереди в Maya по адресу; `ПАРАМЕТР` — `control` или `section` одного сценария. Отчёт каждого прогона и сводка; `--json` — сводка одной строкой, отчёты в stderr. Сценарии и контроли — [docs/scenarios.md](docs/scenarios.md) |
+| `run (СЦЕНАРИИ \| all \| scenarios \| controls) [ПАРАМЕТР=ЗНАЧЕНИЕ] [--jobs N] [--url URL] [--visible] [--slot-wait СЕК] [--json]` | прогнать сценарии в своих Maya (`--jobs`, 3 по умолчанию; Maya, не дождавшаяся слота за `--slot-wait`, выбывает) или по очереди в Maya по адресу; `ПАРАМЕТР` — `control` или `section` одного сценария. Отчёт каждого прогона и сводка; `--json` — сводка одной строкой, отчёты в stderr. Сценарии и контроли — [docs/scenarios.md](docs/scenarios.md) |
 | `doctor` | Maya, `.mod`, пути в нём, версия модуля; патч DCC_MCP — если `MAYA_HARNESS_DCC_MCP_PATCH` указывает на клон DCC_MCP |
 
 Коды возврата: `0` — успех; `1` — код упал или проверка не прошла; `2` — ничего не запущено

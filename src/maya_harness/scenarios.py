@@ -79,15 +79,20 @@ def load_runs(path: Path) -> list[Run]:
 
 
 def parse(items: list[str], table: list[Run]) -> list[Run]:
-    """Scenario names, or one scenario and its `name=value` parameters; `all` is the table."""
+    """Scenario names, or one scenario and its `name=value` parameters; `all` is the table, `scenarios` its
+    runs without a control, `controls` its controls."""
     names = [item for item in items if "=" not in item]
     params = dict(item.split("=", 1) for item in items if "=" in item)
     # A control or a section among several names would replace every run of its scenario: `all section=film`
     # would make 20 runs of it.
-    if params and (len(names) != 1 or names == ["all"]):
+    if params and (len(names) != 1 or names[0] in ("all", "scenarios", "controls")):
         raise Refused("A control or a section runs alone: <scenario> control=<value> | section=<name>.")
     if names == ["all"]:
         return list(table)
+    if names == ["scenarios"]:
+        return [run for run in table if not run.params]
+    if names == ["controls"]:
+        return [run for run in table if run.params]
     expected = {(run.scenario, run.params["control"]): run.expected for run in table if run.params}
     return [Run(name, params, expected.get((name, params.get("control", "")), "")) for name in names]
 
@@ -95,7 +100,7 @@ def parse(items: list[str], table: list[Run]) -> list[Run]:
 def refuse_unknown(runs: list[Run], scenarios: config.Scenarios) -> None:
     """A run of a scenario that is not there, or of a control the table does not list: a typo
     would run the plain scenario."""
-    for run in runs:  # `all` among other names is caught here too: there is no all.py
+    for run in runs:  # `all`, `scenarios` or `controls` among other names is caught here too: there is no all.py
         if not run.scenario.startswith(PREFIX) or not (scenarios.dir / f"{run.scenario}.py").is_file():
             raise Refused(f"no scenario {run.scenario!r} in {scenarios.dir}")
         if set(run.params) == {"section"}:  # the scenario itself refuses a section it has not

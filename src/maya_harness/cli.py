@@ -109,7 +109,9 @@ def parser() -> argparse.ArgumentParser:
     checks = commands.add_parser(
         "run", help="run check scenarios in Mayas of their own", epilog="See docs/scenarios.md."
     )
-    checks.add_argument("items", nargs="+", help="scenario names or all, and name=value parameters")
+    checks.add_argument(
+        "items", nargs="+", help="scenario names, all, scenarios or controls, and name=value parameters"
+    )
     checks.add_argument(
         "--jobs",
         type=int,
