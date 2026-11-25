@@ -35,7 +35,7 @@ maya_harness — пакет и команда `maya-harness`: изолирова
   сеанса).
 * Весь dcc-mcp — в `transport.py`: остальной пакет зовёт `execute(code, timeout)`.
 * Код выполняется только в Maya, которую поднял maya_harness: её отличает маркер в окружении,
-  и `connect` отказывает Maya без него.
+  и `call.connect` отказывает Maya без него.
 * Документы — на русском, без личных путей и имён машин; docstring и комментарии — на
   английском.
 * Как это выглядит в коде — [docs/codestyle.md](docs/codestyle.md).

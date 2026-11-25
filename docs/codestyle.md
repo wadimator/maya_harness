@@ -23,9 +23,12 @@
 * `from __future__ import annotations` — первой строкой кода в каждом модуле пакета, кроме
   `__init__.py`.
 * Контракты и настройки — `@dataclass(frozen=True)` (`config.py`, `session.py`,
-  `transport.py`). Изменяемый `@dataclass` — только у объекта, который держит живой ресурс и
+  `transport.py`, `call.py`, `registry.py`). Изменяемый `@dataclass` — только у объекта, который держит живой ресурс и
   меняет своё состояние: `Session`, `Slot`.
-* Вызовы dcc-mcp — только в `transport.py`; остальной пакет зовёт `execute(code, timeout)`.
+* Вызовы dcc-mcp — только в `transport.py`; остальной пакет зовёт `execute(code, timeout)` у
+  `call.Target` или `Session`.
+* Объявления Win32 API — только в `win32.py`: модуль, который зовёт функцию, не задаёт ей
+  `argtypes`.
 
 ## Язык
 

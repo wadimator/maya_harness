@@ -1,20 +1,28 @@
 # Устройство
 
 Почему раннер устроен так. Подробности в коде — docstring модулей `process`, `session`,
-`slots`, `transport`; здесь — решения целиком.
+`slots`, `transport`, `call`, `registry`, `pool`, `inmaya`; здесь — решения целиком.
 
 ## Модули
 
 | Модуль | Что делает |
 | --- | --- |
-| `process.py` | процесс Maya: скрытый рабочий стол, job object, приоритет, процессоры |
-| `session.py` | каталог сеанса, окружение Maya, `userSetup.py`, `state.json`, уборка; сеанс как API: `start`, `wait` |
-| `transport.py` | всё про dcc-mcp: ожидание сервера, рукопожатие, маркер, вызов кода, `maya-busy` |
-| `config.py` | `[tool.maya_harness]` из `pyproject.toml` проекта |
+| `win32.py` | объявления Win32 API через `ctypes`: библиотеки, константы, структуры, `argtypes` |
+| `process.py` | процесс Maya: скрытый рабочий стол, job object, приоритет, процессоры, живость pid |
+| `transport.py` | всё про dcc-mcp: `/health`, рукопожатие, вызов кода, `maya-busy` |
+| `inmaya.py` | код внутри Maya: библиотека сценария `Check`, `run_sections`, `no_prompts`, `work_dir`; `userSetup.py`, перезагрузка модулей, прогон сценария; имена файлов рабочего каталога и переменных |
+| `call.py` | вызов кода в Maya сеанса: подключение с проверкой маркера, отметки `last_call` и `in_call`, сторож модального диалога, простой и занятость |
 | `slots.py` | слоты машины: общий предел числа Maya, ожидание слота и кого ждём |
-| `run.py` | сценарии проверок: таблица прогонов, вердикт контроля, пул Maya команды `run` |
-| `inmaya.py` | код внутри Maya: библиотека сценария `Check`, `run_sections`, `no_prompts`, `work_dir`; `userSetup.py`, перезагрузка модулей, прогон сценария |
-| `cli.py` | команды `start`, `stop`, `status`, `exec`, `run`, `doctor` |
+| `registry.py` | сеансы на диске, пережившие раннер: `state.json`, выбор, описание, остановка, уборка |
+| `session.py` | каталог сеанса, окружение Maya, `userSetup.py`, ожидание сервера; сеанс как API: `start`, `wait`, `execute`, `release` |
+| `config.py` | `[tool.maya_harness]` из `pyproject.toml` проекта |
+| `scenarios.py` | сценарии проверок: таблица прогонов, разбор, вердикт контроля, сводка |
+| `pool.py` | куда идут прогоны `run`: пул Maya или одна Maya по адресу |
+| `cli.py` | команды `start`, `stop`, `status`, `exec`, `run`, `doctor`: аргументы, печать, коды возврата |
+
+Импорты идут в одну сторону, без циклов: `win32` ← `process` ← `call` ← `slots`, `registry` ←
+`session` ← `config` ← `scenarios` ← `pool` ← `cli`; `transport` и `inmaya` не импортируют
+ничего из пакета, в Maya попадает только `inmaya`.
 
 ## Процесс Maya
 
@@ -147,7 +155,8 @@
 
 * **dcc-mcp in-process** на свободном порту, который раннер выбирает сам (`DCC_MCP_MAYA_PORT`).
   `DCC_MCP_MAYA_SIDECAR=0` и `DCC_MCP_GATEWAY_PORT=0` держат эту Maya вне gateway пользователя.
-* **Весь dcc-mcp — в `transport.py`.** Остальной пакет зовёт `execute(url, code, timeout)`.
+* **Весь dcc-mcp — в `transport.py`.** `transport.execute(url, code, timeout)` зовёт только
+  `call`: остальной пакет выполняет код через `call.Target.execute` или `Session.execute`.
   Свой сервер в `userSetup.py` вместо dcc-mcp отложен: не проверено, вкладывается ли вызов в
   открытие сцены; заменить можно одним модулем.
 * **`maya-busy`.** Патч DCC_MCP отказывает вызову, пришедшему, пока Maya открывает или
