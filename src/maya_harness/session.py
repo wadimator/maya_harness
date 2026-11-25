@@ -67,6 +67,9 @@ PROJECT_VARIABLE = "MAYA_HARNESS_PROJECT"
 MODULE_VARIABLE = "MAYA_HARNESS_DCC_MCP_MOD"
 DEFAULT_MAYA = Path(r"C:\Program Files\Autodesk\Maya2025")
 UNCLAIMED_AGE = 24 * 60 * 60  # seconds a directory without a readable state.json is kept
+STARTUP_TIMEOUT = 180  # seconds for a Maya to start and connect; a cold start takes 12-15
+STARTUP_POLL = 0.25  # seconds between the looks at a starting Maya
+BOOTSTRAP_LOG = "dcc_mcp_bootstrap.jsonl"  # in the work directory: what dcc-mcp did while it loaded
 DROPPED = ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "VIRTUAL_ENV")
 
 # The session's `userSetup.py`: `inmaya.startup`, its traceback in `inmaya.STARTUP` on an error.
@@ -142,10 +145,10 @@ class Session:
         """The pid of the Maya, after `close` too: its server logs are named by it."""
         return self.maya.pid
 
-    def wait(self, timeout: float) -> None:
+    def wait(self, timeout: float = STARTUP_TIMEOUT) -> None:
         """Waits for the dcc-mcp server of the Maya and connects to it; StartError when it does not come."""
         try:
-            transport.wait_for_server(self.url, self.work, self.maya.running, timeout)
+            self._wait_for_server(timeout)
             call.connect(self.url, timeout, work=self.work, pid=self.pid, desktop=self.maya.desktop)
         except (transport.TransportError, TimeoutError, OSError) as error:
             titles = self.maya.window_titles() if self.maya.running() else []
@@ -153,6 +156,26 @@ class Session:
             raise StartError(
                 f"Maya {self.pid} did not start: {error}; its windows {titles}; its logs {logs}"
             ) from error
+
+    def _wait_for_server(self, timeout: float) -> None:
+        """Until the server answers; `inmaya.STARTUP` tells how far `userSetup.py` got."""
+        deadline = time.monotonic() + timeout
+        status = self.work / inmaya.STARTUP
+        while time.monotonic() < deadline:
+            if status.is_file():
+                startup = status.read_text(encoding="utf-8")
+                if startup.startswith("Traceback"):
+                    raise transport.TransportError(f"dcc-mcp failed to load in Maya:\n{startup}")
+            if transport.healthy(self.url):
+                return
+            if not self.maya.running():
+                raise transport.TransportError("Maya exited before its dcc-mcp server started.")
+            time.sleep(STARTUP_POLL)
+        startup = status.read_text(encoding="utf-8") if status.is_file() else "userSetup.py did not run"
+        bootstrap = self.work / BOOTSTRAP_LOG
+        if bootstrap.is_file():
+            startup += f"; dcc-mcp bootstrap:\n{bootstrap.read_text(encoding='utf-8')}"
+        raise TimeoutError(f"No dcc-mcp server at {self.url} after {timeout:.0f} s; {startup}.")
 
     def execute(self, code: str, timeout: float) -> transport.Result:
         """Runs `code` in the Maya as a call of `call.Target`: marked, and cut short on a modal dialog."""
@@ -311,7 +334,7 @@ def environment(base: Mapping[str, str], root: Path, params: SessionParams, port
         DCC_MCP_MAYA_SIDECAR="0",
         DCC_MCP_GATEWAY_PORT="0",
         DCC_MCP_MAYA_PORT=str(port),
-        DCC_MCP_MAYA_BOOTSTRAP_LOG=str(work / "dcc_mcp_bootstrap.jsonl"),
+        DCC_MCP_MAYA_BOOTSTRAP_LOG=str(work / BOOTSTRAP_LOG),
         PYTHONUTF8="1",
         **{
             inmaya.MARKER: str(work),

@@ -116,7 +116,7 @@ from maya_harness import session
 
 params = session.SessionParams("probe", Path.cwd(), sys_path=(Path.cwd() / "src",))
 with session.start(params, visible=False, env=None) as s:
-    s.wait(180)
+    s.wait()  # session.STARTUP_TIMEOUT by default
     result = s.execute("import maya.cmds as c; c.about(v=True)", 60)
     print(result.success, result.value())
 ```

@@ -37,7 +37,6 @@ from typing import Any
 
 BUSY = "maya-busy"
 BUSY_RETRY = 0.5  # seconds between the repeats of a call refused with maya-busy
-STARTUP_TIMEOUT = 180  # seconds for a Maya to start and connect; a cold start takes 12-15
 LOG_DIR = Path(os.environ.get("LOCALAPPDATA", "")) / "dcc-mcp" / "log"
 WATCH_EVERY = 2.0  # seconds between the calls of `watch` while a reply is awaited
 
@@ -89,29 +88,13 @@ def server_logs(pid: int) -> list[Path]:
     return list(LOG_DIR.glob(f"dcc-mcp-maya.{pid}.*.log"))
 
 
-def wait_for_server(url: str, work: Path, running: Callable[[], bool], timeout: float) -> None:
-    """Waits until the server at `url` answers; `work/startup.txt` tells how far `userSetup.py` got."""
-    deadline = time.monotonic() + timeout
-    status = work / "startup.txt"
-    while time.monotonic() < deadline:
-        if status.is_file():
-            startup = status.read_text(encoding="utf-8")
-            if startup.startswith("Traceback"):
-                raise TransportError(f"dcc-mcp failed to load in Maya:\n{startup}")
-        try:
-            with urllib.request.urlopen(url.removesuffix("/mcp") + "/health", timeout=0.5) as response:
-                if json.loads(response.read().decode("utf-8")).get("ok"):
-                    return
-        except OSError:
-            pass
-        if not running():
-            raise TransportError("Maya exited before its dcc-mcp server started.")
-        time.sleep(0.25)
-    startup = status.read_text(encoding="utf-8") if status.is_file() else "userSetup.py did not run"
-    bootstrap = work / "dcc_mcp_bootstrap.jsonl"
-    if bootstrap.is_file():
-        startup += f"; dcc-mcp bootstrap:\n{bootstrap.read_text(encoding='utf-8')}"
-    raise TimeoutError(f"No dcc-mcp server at {url} after {timeout:.0f} s; {startup}.")
+def healthy(url: str) -> bool:
+    """The server at `url` is up: its `/health` answers `ok` within half a second."""
+    try:
+        with urllib.request.urlopen(url.removesuffix("/mcp") + "/health", timeout=0.5) as response:
+            return bool(json.loads(response.read().decode("utf-8")).get("ok"))
+    except (OSError, ValueError, AttributeError):
+        return False
 
 
 def read_in_background(request: urllib.request.Request, timeout: float, watch: Watch | None = None) -> str:

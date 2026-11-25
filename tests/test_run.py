@@ -222,7 +222,7 @@ def test_the_pool_starts_each_maya_on_a_desktop_of_its_own(
         raise TimeoutError("no server")
 
     monkeypatch.setattr(session.process, "MayaProcess", Maya)
-    monkeypatch.setattr(session.transport, "wait_for_server", wait_for_server)
+    monkeypatch.setattr(session.Session, "_wait_for_server", wait_for_server)
     monkeypatch.setattr(session.transport, "server_logs", lambda pid: [])  # the fake pids are not its Mayas
     assert cli.main(["run", "all", "--jobs", "3"]) == cli.NOT_RUN
     assert len(desktops) == 3
@@ -242,7 +242,7 @@ class FakeSession:
     def execute(self, code: str, timeout: float) -> None:
         pass
 
-    def wait(self, timeout: float) -> None:
+    def wait(self, timeout: float = 0) -> None:
         self.waited = True
 
     def close(self) -> None:
@@ -436,7 +436,7 @@ def test_run_ends_once_no_run_is_left_though_a_maya_still_waits_for_a_slot(
         grabbed.wait(5)
 
     monkeypatch.setattr(session.process, "MayaProcess", Maya)
-    monkeypatch.setattr(session.transport, "wait_for_server", lambda *_: None)
+    monkeypatch.setattr(session.Session, "_wait_for_server", lambda *_: None)
     monkeypatch.setattr(session.call, "connect", lambda *_, **__: None)
     monkeypatch.setattr(session.transport, "server_logs", lambda pid: [])
     monkeypatch.setattr(scenario_run, "run_scenario", lambda *_: ([], ""))

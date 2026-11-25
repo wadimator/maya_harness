@@ -162,7 +162,7 @@ def start(args: argparse.Namespace) -> int:
     with session.start(
         params, visible=args.visible, ttl=args.ttl, record=True, temp=temp_dir(), slot_wait=args.slot_wait
     ) as running:
-        running.wait(transport.STARTUP_TIMEOUT)
+        running.wait()
         running.release()
     print(f"Maya {running.pid} of {project.project} is running at {running.url}")
     return OK

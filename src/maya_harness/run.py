@@ -309,7 +309,7 @@ class Pool:
                 return
             begin = time.monotonic()
             try:
-                started.wait(transport.STARTUP_TIMEOUT)
+                started.wait()
             except session.StartError as error:
                 if not self.stop.is_set():
                     self.say(f"{name}: {error}", sys.stderr)

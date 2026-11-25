@@ -340,7 +340,7 @@ def test_with_closes_the_maya_and_removes_the_directory(
         if raised is KeyboardInterrupt:
             raise KeyboardInterrupt
 
-    monkeypatch.setattr(session.transport, "wait_for_server", wait_for_server)
+    monkeypatch.setattr(session.Session, "_wait_for_server", wait_for_server)
     monkeypatch.setattr(session.call, "connect", lambda *_, **__: None)
     with pytest.raises(raised), session.start(STARTED, temp=installed) as started:
         started.wait(1)
@@ -353,9 +353,44 @@ def test_wait_turns_a_timeout_into_start_error(installed: Path, monkeypatch: pyt
     def wait_for_server(*args: object) -> None:
         raise TimeoutError("no server")
 
-    monkeypatch.setattr(session.transport, "wait_for_server", wait_for_server)
+    monkeypatch.setattr(session.Session, "_wait_for_server", wait_for_server)
     with session.start(STARTED, temp=installed) as started, pytest.raises(session.StartError, match="Maya 4242"):
         started.wait(1)
+
+
+def test_wait_shows_the_traceback_of_startup(installed: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A plugin that does not load: `start` fails at once, with the traceback `userSetup.py` wrote."""
+    monkeypatch.setattr(session.transport, "healthy", lambda url: False)
+    with session.start(STARTED, temp=installed) as started:
+        (started.work / inmaya.STARTUP).write_text(
+            "Traceback (most recent call last):\n  no_such_plugin", encoding="utf-8"
+        )
+        with pytest.raises(session.StartError, match=r"(?s)dcc-mcp failed to load in Maya:\nTraceback.*no_such_plugin"):
+            started.wait(60)
+
+
+def test_wait_ends_when_the_server_answers_or_maya_exits(installed: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    answers = iter([False, True])
+    monkeypatch.setattr(session.transport, "healthy", lambda url: next(answers))
+    monkeypatch.setattr(session, "STARTUP_POLL", 0)
+    connected: list[object] = []
+    monkeypatch.setattr(session.call, "connect", lambda url, timeout, **kwargs: connected.append(kwargs["work"]))
+    with session.start(STARTED, temp=installed) as started:
+        started.wait(60)
+        assert connected == [started.work]
+        monkeypatch.setattr(session.transport, "healthy", lambda url: False)
+        started.maya.closed = True  # type: ignore[attr-defined]
+        with pytest.raises(session.StartError, match="Maya exited before its dcc-mcp server started"):
+            started.wait(60)
+
+
+def test_wait_out_of_time_shows_how_far_maya_got(installed: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(session.transport, "healthy", lambda url: False)
+    with session.start(STARTED, temp=installed) as started:
+        (started.work / inmaya.STARTUP).write_text("userSetup.py loaded", encoding="utf-8")
+        (started.work / session.BOOTSTRAP_LOG).write_text('{"step": "import"}', encoding="utf-8")
+        with pytest.raises(session.StartError, match=r'after 0 s; userSetup.py loaded; dcc-mcp bootstrap:\n\{"step"'):
+            started.wait(0)
 
 
 def test_execute_is_a_marked_call(installed: Path, monkeypatch: pytest.MonkeyPatch) -> None:
