@@ -410,3 +410,15 @@ def test_start_names_the_holder_of_its_slot(installed: Path) -> None:
         holder = json.loads((slots.DIR / "slot-1.holder").read_text(encoding="utf-8"))
     assert holder["pid"] == 4242 and holder["created"] == 7 and holder["command"] == "start"
     assert (holder["project"], holder["url"], holder["work"]) == (PROJECT, started.url, str(started.work))
+
+
+def test_watcher_cuts_a_call_short_only_on_a_modal_dialog(monkeypatch: pytest.MonkeyPatch) -> None:
+    dialog: list[str] = []
+    monkeypatch.setattr(process, "modal_dialog", lambda pid, desktop=None: dialog)
+    watch = session.watcher(10, "http://127.0.0.1:1/mcp")
+    watch()
+    dialog.append("Untrusted Plugin Loading - Security Warning")
+    with pytest.raises(session.transport.CallAborted) as raised:
+        watch()
+    assert "Maya 10 shows a modal dialog: ['Untrusted Plugin Loading - Security Warning']" in str(raised.value)
+    assert "maya-harness stop http://127.0.0.1:1/mcp" in str(raised.value)

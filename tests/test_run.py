@@ -240,6 +240,9 @@ class FakeSession:
         self.closed = False
         self.any_closed = closed
 
+    def watch(self) -> None:
+        pass
+
     def wait(self, timeout: float) -> None:
         self.waited = True
 
@@ -280,7 +283,8 @@ def test_a_maya_with_nothing_left_to_run_leaves_before_the_others_end(monkeypatc
     pool, started, out = fake_pool(monkeypatch, runs=2, count=2)
     calls: list[bool] = []
 
-    def run_scenario(url: str, code: str) -> tuple[list[str], str]:
+    def run_scenario(url: str, code: str, watch: object = None) -> tuple[list[str], str]:
+        assert watch is not None  # a Maya of the pool on a dialog is cut short too
         with pool.lock:
             first = not calls
             calls.append(True)
@@ -310,7 +314,7 @@ def test_a_maya_started_when_the_queue_is_empty_is_closed_without_a_wait(monkeyp
 
     pool, started, _ = fake_pool(monkeypatch, runs=1, count=2, start=start)
 
-    def run_scenario(url: str, code: str) -> tuple[list[str], str]:
+    def run_scenario(url: str, code: str, watch: object = None) -> tuple[list[str], str]:
         taken.set()
         return [], ""
 
@@ -351,6 +355,7 @@ def test_run_at_url_fails_the_run_maya_did_not_answer(
             return reply
         raise scenario_run.transport.TransportError("Maya at x stayed maya-busy")
 
+    monkeypatch.setattr(scenario_run.session, "sessions", lambda temp: [])
     monkeypatch.setattr(scenario_run.transport, "connect", lambda *_: tmp_path)
     monkeypatch.setattr(scenario_run.transport, "execute", execute)
     assert cli.main(["run", "--url", "http://x", "all"]) == cli.FAILED
@@ -411,6 +416,7 @@ def test_run_ends_once_no_run_is_left_though_a_maya_still_waits_for_a_slot(
             self.child = stub("import sys; sys.stdin.readline()", stdin=subprocess.PIPE)
             self.pid = self.child.pid
             self.created = 0
+            self.desktop = None
             self.handle = session.process.kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, self.pid)
 
         def running(self) -> bool:
@@ -485,3 +491,44 @@ def test_a_stopped_pool_stops_waiting_for_a_slot(monkeypatch: pytest.MonkeyPatch
     worker.join(5)
     assert not stuck
     assert pool.sessions == {}
+
+
+def test_run_at_url_fails_the_run_that_stands_on_a_dialog(
+    monkeypatch: pytest.MonkeyPatch, project: Path, tmp_path: Path
+) -> None:
+    def watch() -> None:
+        raise scenario_run.transport.CallAborted("Maya 10 shows a modal dialog: ['Untrusted Plugin']")
+
+    def execute(url: str, code: str, timeout: float, watch: Callable[[], None] | None = None) -> object:
+        assert watch is not None
+        watch()
+        raise AssertionError("the watch did not cut the call short")
+
+    monkeypatch.setattr(scenario_run.transport, "execute", execute)
+    out = io.StringIO()
+    runs = [Run("check_fps", {}, ""), Run("check_fps", {"x": "1"}, "")]
+    outcomes = scenario_run.run_at_url("http://x", tmp_path, runs, ["", ""], out, watch)
+    assert not outcomes[0].ok and "modal dialog: ['Untrusted Plugin']" in outcomes[0].text
+    assert 1 not in outcomes
+    assert "not run" in out.getvalue().splitlines()[-1]
+
+
+def test_run_at_url_watches_the_maya_of_the_session_at_that_address(
+    monkeypatch: pytest.MonkeyPatch, project: Path, tmp_path: Path
+) -> None:
+    target = session.Record(tmp_path, session.State("p", str(tmp_path), 10, 1, "http://x", 0.0))
+    watched: list[object] = []
+
+    def watch() -> None:
+        pass
+
+    def execute(url: str, code: str, timeout: float, watch: object = None) -> object:
+        watched.append(watch)
+        return scenario_run.transport.Result(True, "", output='{"failures": []}')
+
+    monkeypatch.setattr(scenario_run.session, "sessions", lambda temp: [target])
+    monkeypatch.setattr(scenario_run.session, "watcher", lambda pid, url, desktop=None: watch)
+    monkeypatch.setattr(scenario_run.transport, "connect", lambda *_: tmp_path)
+    monkeypatch.setattr(scenario_run.transport, "execute", execute)
+    assert cli.main(["run", "--url", "http://x", "check_fps"]) == cli.OK
+    assert watched == [watch]

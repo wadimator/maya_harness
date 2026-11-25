@@ -48,6 +48,7 @@ DUPLICATE_SAME_ACCESS = 0x2
 DESKTOP_READOBJECTS = 0x1
 DESKTOP_ENUMERATE = 0x40
 DESKTOP_PREFIX = "maya_harness_"
+MAIN_TITLE = "Autodesk MAYA"  # in the title of Maya's main window: "untitled - Autodesk MAYA 2025.3.1: untitled"
 
 
 class STARTUPINFOW(ctypes.Structure):
@@ -147,6 +148,7 @@ user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintyp
 user32.IsWindowVisible.argtypes = [wintypes.HWND]
 user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
 user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.IsWindowEnabled.argtypes = [wintypes.HWND]
 DESKENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.LPWSTR, wintypes.LPARAM)
 user32.GetProcessWindowStation.restype = wintypes.HANDLE
 user32.EnumDesktopsW.argtypes = [wintypes.HANDLE, DESKENUMPROC, wintypes.LPARAM]
@@ -289,6 +291,27 @@ def window_titles(pid: int, desktop: object = None) -> list[str]:
     """The visible windows of process `pid` that have a title (Maya has visible ones without),
     on `desktop`; without it, on every hidden desktop of maya_harness and on the current one:
     the Maya of another harness process is on a desktop this one did not make."""
+    return [title for _, title in _windows(pid, desktop)]
+
+
+def modal_dialog(pid: int, desktop: object = None) -> list[str]:
+    """The titles of Maya's other windows when a modal dialog holds its main window, else [].
+
+    Measured in Maya 2025.3.1 on the hidden desktop: the main window is the one with `MAIN_TITLE`
+    in its title. «Untrusted Plugin Loading» and `cmds.confirmDialog` disable it. A call in
+    `time.sleep`, an open Script Editor, `cmds.progressWindow`, the main progress bar and the
+    opening of a 422 MB scene leave it enabled: a busy Maya is not taken for one on a dialog.
+    `confirmDialog` disables it some 0.25 s before the dialog gets its title: a disabled window
+    with no other titled one is [] too, and the next look finds the dialog with its title."""
+    windows = _windows(pid, desktop)
+    main = [window for window, title in windows if MAIN_TITLE in title]
+    if not main or any(user32.IsWindowEnabled(window) for window in main):
+        return []
+    return [title for window, title in windows if window not in main]
+
+
+def _windows(pid: int, desktop: object) -> list[tuple[int, str]]:
+    """The visible titled windows of `pid` and their titles; the desktops as in `window_titles`."""
     if desktop is not None:
         return _titles_on(desktop, pid)
     names: list[str] = []
@@ -308,8 +331,8 @@ def window_titles(pid: int, desktop: object = None) -> list[str]:
     return titles
 
 
-def _titles_on(desktop: object, pid: int) -> list[str]:
-    titles: list[str] = []
+def _titles_on(desktop: object, pid: int) -> list[tuple[int, str]]:
+    titles: list[tuple[int, str]] = []
 
     def collect(window: int, _: int) -> bool:
         owner = wintypes.DWORD()
@@ -317,7 +340,7 @@ def _titles_on(desktop: object, pid: int) -> list[str]:
         if owner.value == pid and user32.IsWindowVisible(window) and user32.GetWindowTextLengthW(window):
             title = ctypes.create_unicode_buffer(512)
             user32.GetWindowTextW(window, title, len(title))
-            titles.append(title.value)
+            titles.append((window, title.value))
         return True
 
     user32.EnumDesktopWindows(desktop, WNDENUMPROC(collect), 0)

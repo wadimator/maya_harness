@@ -28,7 +28,15 @@ class FakeServer:
         monkeypatch.setattr(transport.time, "monotonic", lambda: self.now)
         monkeypatch.setattr(transport.time, "sleep", self.sleep)
 
-    def call(self, url: str, method: str, params: dict[str, object], request_id: int | None, timeout: float) -> Any:
+    def call(
+        self,
+        url: str,
+        method: str,
+        params: dict[str, object],
+        request_id: int | None,
+        timeout: float,
+        watch: object = None,
+    ) -> Any:
         assert timeout > 0
         self.calls += 1
         content = self.replies.pop(0) if len(self.replies) > 1 else self.replies[0]
@@ -98,7 +106,7 @@ def test_connect_refuses_another_session(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_a_refused_connection_did_not_reach_maya(monkeypatch: pytest.MonkeyPatch) -> None:
     """urllib wraps in URLError only what fails while connecting or sending: Maya got no request."""
 
-    def refused(request: urllib.request.Request, timeout: float) -> str:
+    def refused(request: urllib.request.Request, timeout: float, watch: object = None) -> str:
         raise urllib.error.URLError(ConnectionRefusedError(10061, "refused"))
 
     monkeypatch.setattr(transport, "read_in_background", refused)
@@ -117,7 +125,7 @@ def test_a_refused_connection_did_not_reach_maya(monkeypatch: pytest.MonkeyPatch
 def test_a_reset_or_an_http_error_is_not_a_transport_error(monkeypatch: pytest.MonkeyPatch, error: OSError) -> None:
     """Maya got the request: the code may have run, and exec must not say that nothing was run."""
 
-    def fail(request: urllib.request.Request, timeout: float) -> str:
+    def fail(request: urllib.request.Request, timeout: float, watch: object = None) -> str:
         raise error
 
     monkeypatch.setattr(transport, "read_in_background", fail)
@@ -137,7 +145,7 @@ def test_a_reset_or_an_http_error_is_not_a_transport_error(monkeypatch: pytest.M
 def test_an_unreadable_reply_is_a_reply_error(monkeypatch: pytest.MonkeyPatch, reply: str | Exception) -> None:
     """Not a ValueError out of `main`: an OSError, so exec says the code may have run."""
 
-    def read(request: urllib.request.Request, timeout: float) -> str:
+    def read(request: urllib.request.Request, timeout: float, watch: object = None) -> str:
         if isinstance(reply, Exception):
             raise reply
         return reply
@@ -164,7 +172,9 @@ def test_a_value_is_asked_only_of_code_ending_in_an_expression(
     """dcc-mcp fails a value request for code that does not end in an expression."""
     sent: list[object] = []
 
-    def call(url: str, method: str, params: dict[str, Any], request_id: int | None, timeout: float) -> Any:
+    def call(
+        url: str, method: str, params: dict[str, Any], request_id: int | None, timeout: float, watch: object = None
+    ) -> Any:
         sent.append(params["arguments"]["result_type"])
         return {"result": {"structuredContent": ok()}}
 
@@ -189,3 +199,25 @@ def test_a_failure_without_stderr_keeps_the_explanation_of_the_server() -> None:
         "_meta": {"dcc.error": {"type": "RuntimeError", "message": explanation}},
     }
     assert transport.to_result(content).stderr == explanation
+
+
+def test_a_watch_that_raises_cuts_the_wait_for_a_reply_short(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Maya on a modal dialog never replies: only the watch ends the wait."""
+    import threading
+
+    replied = threading.Event()
+
+    def urlopen(request: urllib.request.Request, timeout: float) -> Any:
+        replied.wait(10)
+        raise AssertionError("the reply came before the watch cut the wait")
+
+    def watch() -> None:
+        raise transport.CallAborted("Maya 1 shows a modal dialog")
+
+    monkeypatch.setattr(transport.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(transport, "WATCH_EVERY", 0.0)
+    try:
+        with pytest.raises(transport.CallAborted, match="modal dialog"):
+            transport.read_in_background(urllib.request.Request(URL), 10, watch)
+    finally:
+        replied.set()

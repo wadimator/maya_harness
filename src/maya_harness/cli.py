@@ -3,6 +3,8 @@
 Exit codes: 0 — done; 1 — the code failed or a check did not pass; 2 — nothing was run: no
 Maya, no dcc-mcp module, no session, Maya did not start in time. An `exec` with no reply (a
 timeout, a reset, an unreadable reply) is 1: the code may have run; a refused connection is 2.
+A call cut short because Maya shows a modal dialog is 1 once the code went to Maya, and 2 when
+the connection (its handshake and marker) was cut short.
 `--json` prints one JSON line on stdout and nothing else there.
 """
 
@@ -180,16 +182,23 @@ def run(args: argparse.Namespace) -> int:
     code = args.code if args.code is not None else args.file.read_text(encoding="utf-8")
     url, target = select(args.url)
     packages = config.load(Path.cwd()).reload if args.reload else ()
-    work = transport.connect(url, CALL_TIMEOUT, target.work if target else None)
+    # Only a Maya of a session: the pid of a Maya at a foreign address is unknown.
+    watch = session.watcher(target.state.maya_pid, url) if target else None
+    # A connect cut short on a dialog is a TransportError out of `main`: the code was not sent.
+    work = transport.connect(url, CALL_TIMEOUT, target.work if target else None, watch)
     session.touch(work)
     try:
         # A call of its own, not a prefix of the code: `from __future__` must open the code, and
         # the line numbers of its traceback must be the file's.
-        result = transport.execute(url, reload_code(packages), CALL_TIMEOUT) if packages else transport.Result(True)
+        result = (
+            transport.execute(url, reload_code(packages), CALL_TIMEOUT, watch) if packages else transport.Result(True)
+        )
         if result.success:
-            result = transport.execute(url, code, CALL_TIMEOUT)
+            result = transport.execute(url, code, CALL_TIMEOUT, watch)
     except OSError as error:  # a timeout, a reset: the code reached Maya and may have run
         result = transport.Result(False, type(error).__name__, stderr=f"no reply from {url}: {error}")
+    except transport.CallAborted as error:  # the code reached Maya and runs on after the dialog
+        result = transport.Result(False, type(error).__name__, stderr=str(error))
     finally:
         session.touch(work)
     if args.json:
@@ -221,8 +230,10 @@ def run_scenarios(args: argparse.Namespace) -> int:
     codes = [scenario_run.code_of(item, project.scenarios.dir, project.reload) for item in runs]
     out = sys.stderr if args.json else sys.stdout
     if args.url:
-        work = transport.connect(args.url, CALL_TIMEOUT)
-        outcomes = scenario_run.run_at_url(args.url, work, runs, codes, out)
+        _, target = select(args.url)
+        watch = session.watcher(target.state.maya_pid, args.url) if target else None
+        work = transport.connect(args.url, CALL_TIMEOUT, None, watch)
+        outcomes = scenario_run.run_at_url(args.url, work, runs, codes, out, watch)
     else:
         count = 1 if args.visible else max(1, min(args.jobs, len(runs)))
         pool = scenario_run.run_in_pool(project, runs, codes, count, args.visible, temp_dir(), out, args.slot_wait)
