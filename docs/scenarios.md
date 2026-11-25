@@ -4,7 +4,7 @@
 написать для неё сценарий.
 
 Чего здесь нет: что проверяют сценарии конкретного плагина — это в его документации;
-устройство раннера — в docstring `src/maya_harness/run.py`.
+устройство раннера — в docstring `src/maya_harness/scenarios.py` и `src/maya_harness/pool.py`.
 
 ## Настройки
 

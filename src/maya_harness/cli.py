@@ -21,8 +21,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from . import call, config, process, registry, session, slots, transport
-from . import run as scenario_run
+from . import call, config, pool, process, registry, scenarios, session, slots, transport
 from .registry import Record
 
 CALL_TIMEOUT = 900  # seconds per `exec`, by default
@@ -107,20 +106,20 @@ def parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--json", action="store_true")
 
-    scenarios = commands.add_parser(
+    checks = commands.add_parser(
         "run", help="run check scenarios in Mayas of their own", epilog="See docs/scenarios.md."
     )
-    scenarios.add_argument("items", nargs="+", help="scenario names or all, and name=value parameters")
-    scenarios.add_argument(
+    checks.add_argument("items", nargs="+", help="scenario names or all, and name=value parameters")
+    checks.add_argument(
         "--jobs",
         type=int,
-        default=scenario_run.JOBS,
-        help=f"Mayas at once, {scenario_run.JOBS} by default; one with --visible",
+        default=pool.JOBS,
+        help=f"Mayas at once, {pool.JOBS} by default; one with --visible",
     )
-    scenarios.add_argument("--url", help="run in this Maya, which `start` left running")
-    scenarios.add_argument("--visible", action="store_true", help="start the Maya on the usual desktop")
-    scenarios.add_argument("--slot-wait", **SLOT_WAIT)
-    scenarios.add_argument("--json", action="store_true", help="the summary as one JSON line; the reports go to stderr")
+    checks.add_argument("--url", help="run in this Maya, which `start` left running")
+    checks.add_argument("--visible", action="store_true", help="start the Maya on the usual desktop")
+    checks.add_argument("--slot-wait", **SLOT_WAIT)
+    checks.add_argument("--json", action="store_true", help="the summary as one JSON line; the reports go to stderr")
 
     commands.add_parser("doctor", help="check Maya, the dcc-mcp module and its patch")
     return main
@@ -138,7 +137,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         session.StartError,
         slots.NoSlot,
         config.ConfigError,
-        scenario_run.Refused,
+        scenarios.Refused,
         transport.TransportError,
         TimeoutError,
         OSError,
@@ -243,27 +242,27 @@ def run_scenarios(args: argparse.Namespace) -> int:
     project = config.load(Path.cwd())
     if project.scenarios is None:
         raise NotRun(f"no [tool.maya_harness.scenarios] in the pyproject.toml of {project.root}")
-    runs = scenario_run.parse(args.items, scenario_run.load_runs(project.scenarios.runs))
-    scenario_run.refuse_unknown(runs, project.scenarios)
+    runs = scenarios.parse(args.items, scenarios.load_runs(project.scenarios.runs))
+    scenarios.refuse_unknown(runs, project.scenarios)
     if args.jobs < 1:
         raise NotRun("--jobs takes 1 or more")
-    if args.jobs > scenario_run.MAX_JOBS:
-        print(f"--jobs {args.jobs}: more than {scenario_run.MAX_JOBS} Mayas slow each other down.", file=sys.stderr)
-    codes = [scenario_run.code_of(item, project.scenarios.dir, project.reload) for item in runs]
+    if args.jobs > pool.MAX_JOBS:
+        print(f"--jobs {args.jobs}: more than {pool.MAX_JOBS} Mayas slow each other down.", file=sys.stderr)
+    codes = [scenarios.code_of(item, project.scenarios.dir, project.reload) for item in runs]
     out = sys.stderr if args.json else sys.stdout
     if args.url:
         _, record = select(args.url)
         target = call.connect(args.url, CALL_TIMEOUT, pid=record.state.maya_pid if record else None)
-        outcomes = scenario_run.run_at_url(target, runs, codes, out)
+        outcomes = pool.run_at(target, runs, codes, out)
     else:
         count = 1 if args.visible else max(1, min(args.jobs, len(runs)))
-        pool = scenario_run.run_in_pool(project, runs, codes, count, args.visible, temp_dir(), out, args.slot_wait)
-        if not pool.ready:
+        ran = pool.run_in_pool(project, runs, codes, count, args.visible, temp_dir(), out, args.slot_wait)
+        if not ran.ready:
             raise NotRun("no Maya started; see the errors above")
-        outcomes = pool.outcomes
+        outcomes = ran.outcomes
     if args.json:
-        print(json.dumps(scenario_run.summary(runs, outcomes), ensure_ascii=False))
-    return OK if scenario_run.passed(runs, outcomes) else FAILED
+        print(json.dumps(scenarios.summary(runs, outcomes), ensure_ascii=False))
+    return OK if scenarios.passed(runs, outcomes) else FAILED
 
 
 def stop(args: argparse.Namespace) -> int:

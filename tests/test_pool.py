@@ -1,4 +1,4 @@
-"""What `run` runs and whether a run passed; the Mayas themselves are checked by running it."""
+"""Where the runs go: the pool of Mayas and the one at `--url`; the Mayas themselves are checked by running it."""
 
 import io
 import itertools
@@ -10,172 +10,8 @@ from pathlib import Path
 
 import pytest
 
-from maya_harness import call, cli, config, inmaya, registry, session, slots, win32
-from maya_harness import run as scenario_run
-from maya_harness.run import Run
-
-TABLE = """
-[[run]]
-scenario = "check_fps"
-seconds = 6
-
-[[run]]
-scenario = "check_bake"
-seconds = 34
-
-[[run]]
-scenario = "check_bake"
-control = "no_round"
-expect = "film.whole_frames"
-seconds = 8
-"""
-ALL = [
-    Run("check_bake", {}, ""),
-    Run("check_bake", {"control": "no_round"}, "film.whole_frames"),
-    Run("check_fps", {}, ""),
-]
-
-
-@pytest.fixture
-def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """A project with two scenarios and its table of runs; the current directory, its sessions in `temp`."""
-    root = tmp_path / "plugin"
-    checks = root / "checks"
-    checks.mkdir(parents=True)
-    for name in ("check_fps", "check_bake"):
-        (checks / f"{name}.py").write_text("def run(**params): ...\n", encoding="utf-8")
-    (checks / "runs.toml").write_text(TABLE, encoding="utf-8")
-    (root / "pyproject.toml").write_text(
-        '[tool.maya_harness]\nreload = ["plugin"]\n'
-        '[tool.maya_harness.scenarios]\ndir = "checks"\nruns = "checks/runs.toml"\n',
-        encoding="utf-8",
-    )
-    (tmp_path / "temp").mkdir()
-    monkeypatch.setattr(cli, "temp_dir", lambda: tmp_path / "temp")
-    monkeypatch.chdir(root)
-    return root
-
-
-def scenarios(root: Path) -> config.Scenarios:
-    found = config.load(root).scenarios
-    assert found is not None
-    return found
-
-
-def test_load_runs_takes_the_longest_first(project: Path) -> None:
-    assert scenario_run.load_runs(scenarios(project).runs) == ALL
-
-
-@pytest.mark.parametrize(
-    ("entry", "refusal"),
-    [
-        ('scenario = "fps"', "its scenario check_<name>"),
-        ('scenario = "check_fps"\nsecond = 6', "a run is scenario, control, expect, seconds"),
-        ('scenario = "check_fps"\ncontrol = "x"', "a control and its expect go together"),
-        ('scenario = "check_fps"\nexpect = "x"', "a control and its expect go together"),
-        ('scenario = "check_fps"\nseconds = "6"', "seconds must be a number"),
-        ('scenario = "check_bake"\ncontrol = "no_round"\nexpect = "x"', "listed twice"),
-    ],
-)
-def test_load_runs_refuses_a_wrong_entry(tmp_path: Path, entry: str, refusal: str) -> None:
-    table = tmp_path / "runs.toml"
-    table.write_text(f"{TABLE}\n[[run]]\n{entry}\n", encoding="utf-8")
-    with pytest.raises(scenario_run.Refused, match=refusal):
-        scenario_run.load_runs(table)
-
-
-@pytest.mark.parametrize(
-    ("expected", "failures", "result"),
-    [
-        ("", [], (True, "ok")),
-        ("", ["load.scan: [] != ['a']", "load.raised: boom"], (False, "FAIL: 2 failures")),
-        (
-            "film.whole_frames",
-            ["film.whole_frames: [10.4] != []"],
-            (True, "ok: the control failed on film.whole_frames"),
-        ),
-        ("film.whole_frames", [], (False, "FAIL: the control passed")),
-        (
-            "film.whole_frames",
-            ["film.keys: (10, 147) != (11, 147)", "film.whole_frames: [10.4] != []"],
-            (False, "FAIL: the control failed on film.keys, expected film.whole_frames"),
-        ),
-        (
-            "fingers.gloves",
-            ["fingers.gloves_rad: False != True"],
-            (False, "FAIL: the control failed on fingers.gloves_rad, expected fingers.gloves"),
-        ),
-        ("", None, (False, "FAIL: raised")),
-        ("film.whole_frames", None, (False, "FAIL: raised")),
-    ],
-)
-def test_verdict(expected: str, failures: list[str] | None, result: tuple[bool, str]) -> None:
-    assert scenario_run.verdict(expected, failures) == result
-
-
-@pytest.mark.parametrize(
-    ("argv", "runs"),
-    [
-        (["check_fps"], [Run("check_fps", {}, "")]),
-        (["check_fps", "check_bake"], [Run("check_fps", {}, ""), Run("check_bake", {}, "")]),
-        (["check_bake", "section=film"], [Run("check_bake", {"section": "film"}, "")]),
-        (["check_bake", "control=no_round"], [Run("check_bake", {"control": "no_round"}, "film.whole_frames")]),
-        (["check_bake", "control=nope"], [Run("check_bake", {"control": "nope"}, "")]),
-        (["all"], ALL),
-    ],
-)
-def test_parse(argv: list[str], runs: list[Run]) -> None:
-    assert scenario_run.parse(argv, ALL) == runs
-
-
-@pytest.mark.parametrize(
-    "argv",
-    [
-        ["all", "section=film"],
-        ["all", "control=no_round"],
-        ["check_bake", "check_fps", "section=film"],
-        ["check_bake", "check_fps", "control=no_round"],
-    ],
-)
-def test_parse_refuses_parameters_of_several_runs(argv: list[str]) -> None:
-    with pytest.raises(scenario_run.Refused, match="A control or a section runs alone"):
-        scenario_run.parse(argv, ALL)
-
-
-def test_code_runs_the_scenario_through_inmaya(project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    code = scenario_run.code_of(Run("check_bake", {"control": "no_round"}, "x"), project / "checks", ("plugin",))
-    called: list[object] = []
-    monkeypatch.setattr(inmaya, "run_scenario", lambda *args: called.append(args) or "{}")
-    exec(code, {})
-    assert called == [(str(project / "checks"), "check_bake", {"control": "no_round"}, ("plugin",))]
-    assert code.rstrip().splitlines()[-1].startswith("_maya_harness_inmaya.run_scenario(")  # the report is its value
-
-
-@pytest.mark.parametrize(
-    ("argv", "refusal"),
-    [
-        (["run", "check_bake", "control=no_rnd"], "check_bake has no control {'control': 'no_rnd'}"),
-        (["run", "check_bake", "film=1"], "check_bake has no control {'film': '1'}"),
-        (["run", "check_fps", "all"], "no scenario 'all'"),
-        (["run", "check_nope"], "no scenario 'check_nope'"),
-        (["run", "check_fps", "--jobs", "0"], "--jobs takes 1 or more"),
-    ],
-)
-def test_run_refuses_before_maya_starts(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], project: Path, argv: list[str], refusal: str
-) -> None:
-    monkeypatch.setattr(session, "prepare", lambda *_, **__: pytest.fail("Maya started"))
-    # The text too: code 2 alone passes on a refusal for another reason.
-    assert (cli.main(argv), refusal in capsys.readouterr().err) == (cli.NOT_RUN, True)
-
-
-def test_run_without_scenario_settings_runs_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    (tmp_path / "pyproject.toml").write_text("[tool.maya_harness]\n", encoding="utf-8")
-    monkeypatch.chdir(tmp_path)
-    assert cli.main(["run", "all"]) == cli.NOT_RUN
-    assert "no [tool.maya_harness.scenarios]" in capsys.readouterr().err
+from maya_harness import call, cli, pool, registry, session, slots, transport, win32
+from maya_harness.scenarios import Run
 
 
 @pytest.fixture
@@ -252,10 +88,10 @@ class FakeSession:
 
 def fake_pool(
     monkeypatch: pytest.MonkeyPatch, runs: int, count: int, start: Callable[[], None] = lambda: None
-) -> tuple[scenario_run.Pool, list[FakeSession], io.StringIO]:
+) -> tuple[pool.Pool, list[FakeSession], io.StringIO]:
     """A pool of `count` workers and `runs` runs; `start` runs inside each `session.start`."""
     out = io.StringIO()
-    pool = scenario_run.Pool(
+    workers = pool.Pool(
         [Run(f"check_{index}", {}, "") for index in range(runs)],
         [""] * runs,
         count,
@@ -269,30 +105,30 @@ def fake_pool(
 
     def fake_start(*_: object, **__: object) -> FakeSession:
         start()
-        with pool.lock:
+        with workers.lock:
             started.append(FakeSession(len(started) + 1, closed))
             return started[-1]
 
-    monkeypatch.setattr(scenario_run.session, "start", fake_start)
-    return pool, started, out
+    monkeypatch.setattr(session, "start", fake_start)
+    return workers, started, out
 
 
 def test_a_maya_with_nothing_left_to_run_leaves_before_the_others_end(monkeypatch: pytest.MonkeyPatch) -> None:
     """The run of one Maya ends only once the other Maya, with nothing left to run, is closed."""
-    pool, started, out = fake_pool(monkeypatch, runs=2, count=2)
+    workers, started, out = fake_pool(monkeypatch, runs=2, count=2)
     calls: list[bool] = []
 
     def run_scenario(execute: object, code: str) -> tuple[list[str], str]:
         assert getattr(execute, "__self__", None) in started  # the call of the session: marked and watched
-        with pool.lock:
+        with workers.lock:
             first = not calls
             calls.append(True)
         if first:
             calls.append(started[0].any_closed.wait(5))
         return [], ""
 
-    monkeypatch.setattr(scenario_run, "run_scenario", run_scenario)
-    assert pool.run()
+    monkeypatch.setattr(pool, "run_scenario", run_scenario)
+    assert workers.run()
     assert calls == [True, True, True]  # the first run saw a Maya closed before it ended
     assert all(item.waited and item.closed for item in started)
     text = out.getvalue()
@@ -311,14 +147,14 @@ def test_a_maya_started_when_the_queue_is_empty_is_closed_without_a_wait(monkeyp
             second_in.set()
             taken.wait(5)
 
-    pool, started, _ = fake_pool(monkeypatch, runs=1, count=2, start=start)
+    workers, started, _ = fake_pool(monkeypatch, runs=1, count=2, start=start)
 
     def run_scenario(execute: object, code: str) -> tuple[list[str], str]:
         taken.set()
         return [], ""
 
-    monkeypatch.setattr(scenario_run, "run_scenario", run_scenario)
-    assert pool.run()
+    monkeypatch.setattr(pool, "run_scenario", run_scenario)
+    assert workers.run()
     first, second = started
     assert first.waited and first.closed
     assert not second.waited and second.closed
@@ -326,47 +162,38 @@ def test_a_maya_started_when_the_queue_is_empty_is_closed_without_a_wait(monkeyp
 
 def test_a_maya_started_after_a_stop_is_closed_without_a_wait(monkeypatch: pytest.MonkeyPatch) -> None:
     """Ctrl+C while a Maya starts: it must not be waited for past the harness closing the others."""
-    pool, started, _ = fake_pool(monkeypatch, runs=1, count=1, start=lambda: pool.stop.set())
-    monkeypatch.setattr(scenario_run, "run_scenario", lambda *_: pytest.fail("a run after the stop"))
-    assert not pool.run()
+    workers, started, _ = fake_pool(monkeypatch, runs=1, count=1, start=lambda: workers.stop.set())
+    monkeypatch.setattr(pool, "run_scenario", lambda *_: pytest.fail("a run after the stop"))
+    assert not workers.run()
     (only,) = started
     assert not only.waited and only.closed
-    assert pool.outcomes == {}
+    assert workers.outcomes == {}
 
 
 @pytest.mark.parametrize("output", ['{"x": 1}', "null", '{"failures": "load"}', '{"failures": [1]}'])
 def test_a_report_without_a_list_of_failures_is_a_raised_scenario(monkeypatch: pytest.MonkeyPatch, output: str) -> None:
-    failures, text = scenario_run.run_scenario(
-        lambda code, timeout: scenario_run.transport.Result(True, "", output=output), ""
-    )
+    failures, text = pool.run_scenario(lambda code, timeout: transport.Result(True, "", output=output), "")
     assert failures is None
     assert "no report with a list of failures" in text
 
 
-def test_run_at_url_fails_the_run_maya_did_not_answer(
+def test_run_at_fails_the_run_maya_did_not_answer(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], project: Path, tmp_path: Path
 ) -> None:
-    replies = iter([scenario_run.transport.Result(True, "", output='{"failures": []}')])
+    replies = iter([transport.Result(True, "", output='{"failures": []}')])
 
-    def execute(*_: object) -> scenario_run.transport.Result:
+    def execute(*_: object) -> transport.Result:
         for reply in replies:
             return reply
-        raise scenario_run.transport.TransportError("Maya at x stayed maya-busy")
+        raise transport.TransportError("Maya at x stayed maya-busy")
 
     monkeypatch.setattr(registry, "running", lambda temp: [])
     monkeypatch.setattr(call, "connect", lambda url, timeout, **_: call.Target(url, tmp_path))
-    monkeypatch.setattr(scenario_run.transport, "execute", execute)
+    monkeypatch.setattr(transport, "execute", execute)
     assert cli.main(["run", "--url", "http://x", "all"]) == cli.FAILED
     out = capsys.readouterr().out
     assert "FAIL: no reply from http://x — TransportError: Maya at x stayed maya-busy" in out
     assert "check_fps" in out.splitlines()[-1] and "not run" in out.splitlines()[-1]
-
-
-def test_load_runs_refuses_a_run_that_is_not_a_table(tmp_path: Path) -> None:
-    table = tmp_path / "runs.toml"
-    table.write_text('run = ["check_fps"]\n', encoding="utf-8")
-    with pytest.raises(scenario_run.Refused, match=r"a run is a \[\[run\]\] table"):
-        scenario_run.load_runs(table)
 
 
 def test_run_json_with_every_slot_taken_keeps_stdout_one_json_line(
@@ -439,7 +266,7 @@ def test_run_ends_once_no_run_is_left_though_a_maya_still_waits_for_a_slot(
     monkeypatch.setattr(session.Session, "_wait_for_server", lambda *_: None)
     monkeypatch.setattr(session.call, "connect", lambda *_, **__: None)
     monkeypatch.setattr(session.transport, "server_logs", lambda pid: [])
-    monkeypatch.setattr(scenario_run, "run_scenario", lambda *_: ([], ""))
+    monkeypatch.setattr(pool, "run_scenario", lambda *_: ([], ""))
     monkeypatch.setattr(slots, "pause", pause)
     code: list[int] = []
     runner = threading.Thread(
@@ -463,7 +290,7 @@ def test_a_stopped_pool_stops_waiting_for_a_slot(monkeypatch: pytest.MonkeyPatch
 
     monkeypatch.setenv(slots.VARIABLE, "1")
     held = slots.take(0)
-    pool = scenario_run.Pool(
+    workers = pool.Pool(
         [Run("check_0", {}, "")], [""], 1, session.SessionParams("p", Path("C:/p")), False, Path("C:/t"), io.StringIO()
     )
 
@@ -476,23 +303,23 @@ def test_a_stopped_pool_stops_waiting_for_a_slot(monkeypatch: pytest.MonkeyPatch
             raise session.StartError(str(error)) from error
         pytest.fail("got a slot")
 
-    monkeypatch.setattr(scenario_run.session, "start", fake_start)
-    monkeypatch.setattr(slots, "pause", lambda seconds: pool.stop.set())  # the stop comes while it waits
-    worker = threading.Thread(target=pool.work, args=(0,), daemon=True)
+    monkeypatch.setattr(session, "start", fake_start)
+    monkeypatch.setattr(slots, "pause", lambda seconds: workers.stop.set())  # the stop comes while it waits
+    worker = threading.Thread(target=workers.work, args=(0,), daemon=True)
     worker.start()
     worker.join(5)
     stuck = worker.is_alive()
     held.release()
     worker.join(5)
     assert not stuck
-    assert pool.sessions == {}
+    assert workers.sessions == {}
 
 
-def test_run_at_url_fails_the_run_that_stands_on_a_dialog(
+def test_run_at_fails_the_run_that_stands_on_a_dialog(
     monkeypatch: pytest.MonkeyPatch, project: Path, tmp_path: Path
 ) -> None:
     def watch() -> None:
-        raise scenario_run.transport.CallAborted("Maya 10 shows a modal dialog: ['Untrusted Plugin']")
+        raise transport.CallAborted("Maya 10 shows a modal dialog: ['Untrusted Plugin']")
 
     def execute(url: str, code: str, timeout: float, watch: Callable[[], None] | None = None) -> object:
         assert watch is not None and call.activity(tmp_path, 0)[0] is not None  # status: busy
@@ -500,17 +327,17 @@ def test_run_at_url_fails_the_run_that_stands_on_a_dialog(
         raise AssertionError("the watch did not cut the call short")
 
     monkeypatch.setattr(call, "watcher", lambda pid, url, desktop=None: watch)
-    monkeypatch.setattr(scenario_run.transport, "execute", execute)
+    monkeypatch.setattr(transport, "execute", execute)
     out = io.StringIO()
     runs = [Run("check_fps", {}, ""), Run("check_fps", {"x": "1"}, "")]
-    outcomes = scenario_run.run_at_url(call.Target("http://x", tmp_path, 10), runs, ["", ""], out)
+    outcomes = pool.run_at(call.Target("http://x", tmp_path, 10), runs, ["", ""], out)
     assert not outcomes[0].ok and "modal dialog: ['Untrusted Plugin']" in outcomes[0].text
     assert 1 not in outcomes
     assert "not run" in out.getvalue().splitlines()[-1]
     assert call.activity(tmp_path, 0)[0] is None
 
 
-def test_run_at_url_watches_the_maya_of_the_session_at_that_address(
+def test_run_at_watches_the_maya_of_the_session_at_that_address(
     monkeypatch: pytest.MonkeyPatch, project: Path, tmp_path: Path
 ) -> None:
     target = registry.Record(tmp_path, registry.State("p", str(tmp_path), 1, "http://x", 0.0, 0, 1))
@@ -521,11 +348,11 @@ def test_run_at_url_watches_the_maya_of_the_session_at_that_address(
 
     def execute(url: str, code: str, timeout: float, watch: object = None) -> object:
         watched.append(watch)
-        return scenario_run.transport.Result(True, "", output='{"failures": []}')
+        return transport.Result(True, "", output='{"failures": []}')
 
     monkeypatch.setattr(registry, "running", lambda temp: [target])
     monkeypatch.setattr(call, "watcher", lambda pid, url, desktop=None: watch)
     monkeypatch.setattr(call, "connect", lambda url, timeout, pid=None, **_: call.Target(url, tmp_path, pid))
-    monkeypatch.setattr(scenario_run.transport, "execute", execute)
+    monkeypatch.setattr(transport, "execute", execute)
     assert cli.main(["run", "--url", "http://x", "check_fps"]) == cli.OK
     assert watched == [watch]

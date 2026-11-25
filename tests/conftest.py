@@ -6,9 +6,24 @@ from typing import Any
 
 import pytest
 
-from maya_harness import slots
+from maya_harness import cli, slots
 
 CREATE_NO_WINDOW = 0x08000000
+TABLE = """
+[[run]]
+scenario = "check_fps"
+seconds = 6
+
+[[run]]
+scenario = "check_bake"
+seconds = 34
+
+[[run]]
+scenario = "check_bake"
+control = "no_round"
+expect = "film.whole_frames"
+seconds = 8
+"""
 
 
 @pytest.fixture(autouse=True)
@@ -44,3 +59,23 @@ def stub() -> Iterator[Callable[..., subprocess.Popen[str]]]:
     for child in started:
         child.kill()
         child.wait(5)
+
+
+@pytest.fixture
+def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A project with two scenarios and its table of runs; the current directory, its sessions in `temp`."""
+    root = tmp_path / "plugin"
+    checks = root / "checks"
+    checks.mkdir(parents=True)
+    for name in ("check_fps", "check_bake"):
+        (checks / f"{name}.py").write_text("def run(**params): ...\n", encoding="utf-8")
+    (checks / "runs.toml").write_text(TABLE, encoding="utf-8")
+    (root / "pyproject.toml").write_text(
+        '[tool.maya_harness]\nreload = ["plugin"]\n'
+        '[tool.maya_harness.scenarios]\ndir = "checks"\nruns = "checks/runs.toml"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "temp").mkdir()
+    monkeypatch.setattr(cli, "temp_dir", lambda: tmp_path / "temp")
+    monkeypatch.chdir(root)
+    return root
