@@ -29,7 +29,9 @@
   Idle is the age of `work/last_call`, which `exec` touches before and after its call: the timer
   is on Maya's main thread and is silent while a call runs there, so without the touch after
   the call a call longer than the TTL would be followed by a quit at once. Qt runs the timer
-  inside a modal dialog's loop too: a Maya stuck on a dialog still quits.
+  inside a modal dialog's loop too: a Maya stuck on a dialog still quits. `work/in_call` tells
+  `status`, `stop` and a harness waiting for a slot a running call from idleness;
+  the timer still counts from `last_call`.
 * `userSetup.py` turns off the userSetup checksum: otherwise `quit` stops at the modal «Secure
   UserSetup Checksum verification», since `userSetup.py` is new in every session. A
   `userPrefs.mel` written in advance does not do it: Maya's first start in a new settings
@@ -178,6 +180,11 @@ class Session:
         """The pid of the Maya, after `close` too: its server logs are named by it."""
         return self.maya.pid
 
+    @property
+    def watch(self) -> transport.Watch:
+        """Cuts a call short when this Maya stands on a modal dialog: see `watcher`."""
+        return watcher(self.pid, self.url, self.maya.desktop)
+
     def wait(self, timeout: float) -> None:
         """Waits for the dcc-mcp server of the Maya and connects to it; StartError when it does not come."""
         try:
@@ -287,6 +294,22 @@ def read_state(root: Path) -> State | None:
 def touch(work: Path) -> None:
     """Marks a call: the idle timer of the session counts from the mtime of `last_call`."""
     (work / "last_call").touch()
+
+
+def watcher(pid: int, url: str, desktop: object = None) -> transport.Watch:
+    """The `watch` of a call into the Maya `pid`: raises `CallAborted` with the dialog's title
+    when a modal dialog holds Maya, which takes no call until someone answers it. The call is
+    not taken back: the code runs on once the dialog is answered, so Maya is left as it is."""
+
+    def watch() -> None:
+        titles = process.modal_dialog(pid, desktop)
+        if titles:
+            raise transport.CallAborted(
+                f"Maya {pid} shows a modal dialog: {titles}; the call is still running there: "
+                f"answer it, or maya-harness stop {url}"
+            )
+
+    return watch
 
 
 def write_state(root: Path, state: State) -> None:

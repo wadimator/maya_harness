@@ -1,10 +1,11 @@
 import json
+import os
 import time
 from pathlib import Path
 
 import pytest
 
-from maya_harness import cli, session, transport
+from maya_harness import cli, session, slots, transport
 from maya_harness.session import Record, State
 
 
@@ -96,13 +97,13 @@ def test_exec_touches_last_call_after_a_failed_call(monkeypatch: pytest.MonkeyPa
     work.mkdir()
     last_call = work / "last_call"
 
-    def execute(url: str, code: str, timeout: float) -> transport.Result:
+    def execute(url: str, code: str, timeout: float, watch: object = None) -> transport.Result:
         last_call.touch()
         os.utime(last_call, (0, 0))  # the call took longer than any TTL
         raise ConnectionResetError("the call was cut")
 
     monkeypatch.setattr(cli, "select", lambda url: ("http://127.0.0.1:1/mcp", None))
-    monkeypatch.setattr(transport, "connect", lambda url, timeout, expected=None: work)
+    monkeypatch.setattr(transport, "connect", lambda url, timeout, expected=None, watch=None: work)
     monkeypatch.setattr(transport, "execute", execute)
     assert cli.main(["exec", "-c", "1"]) == cli.FAILED  # the code reached Maya
     assert last_call.stat().st_mtime > 1_000_000_000
@@ -115,11 +116,11 @@ def test_exec_whose_maya_refuses_the_connection_runs_nothing(monkeypatch: pytest
 
     from maya_harness import transport
 
-    def refused(request: urllib.request.Request, timeout: float) -> str:
+    def refused(request: urllib.request.Request, timeout: float, watch: object = None) -> str:
         raise urllib.error.URLError(ConnectionRefusedError(10061, "refused"))
 
     monkeypatch.setattr(cli, "select", lambda url: ("http://127.0.0.1:1/mcp", None))
-    monkeypatch.setattr(transport, "connect", lambda url, timeout, expected=None: tmp_path)
+    monkeypatch.setattr(transport, "connect", lambda url, timeout, expected=None, watch=None: tmp_path)
     monkeypatch.setattr(transport, "read_in_background", refused)
     assert cli.main(["exec", "-c", "1"]) == cli.NOT_RUN
 
@@ -131,9 +132,9 @@ def test_exec_with_an_unreadable_reply_exits_1_and_at_connect_2(
     from maya_harness import transport
 
     monkeypatch.setattr(cli, "select", lambda url: ("http://127.0.0.1:1/mcp", None))
-    monkeypatch.setattr(transport, "read_in_background", lambda request, timeout: "<html></html>")
+    monkeypatch.setattr(transport, "read_in_background", lambda request, timeout, watch=None: "<html></html>")
     assert cli.main(["exec", "-c", "1"]) == cli.NOT_RUN
-    monkeypatch.setattr(transport, "connect", lambda url, timeout, expected=None: tmp_path)
+    monkeypatch.setattr(transport, "connect", lambda url, timeout, expected=None, watch=None: tmp_path)
     assert cli.main(["exec", "-c", "1"]) == cli.FAILED
 
 
@@ -177,14 +178,14 @@ def test_exec_reload_is_a_call_of_its_own(monkeypatch: pytest.MonkeyPatch, tmp_p
 
     sent: list[str] = []
 
-    def execute(url: str, code: str, timeout: float) -> transport.Result:
+    def execute(url: str, code: str, timeout: float, watch: object = None) -> transport.Result:
         sent.append(code)
         return transport.Result(True)
 
     code = "from __future__ import annotations\n1"
     monkeypatch.setattr(cli, "select", lambda url: ("http://127.0.0.1:1/mcp", None))
     monkeypatch.setattr(config, "load", lambda start: config.Config("p", tmp_path, reload=("pkg",)))
-    monkeypatch.setattr(transport, "connect", lambda url, timeout, expected=None: tmp_path)
+    monkeypatch.setattr(transport, "connect", lambda url, timeout, expected=None, watch=None: tmp_path)
     monkeypatch.setattr(transport, "execute", execute)
     assert cli.main(["exec", "--reload", "-c", code]) == cli.OK
     assert sent == [cli.reload_code(("pkg",)), code]
@@ -213,8 +214,8 @@ def test_exec_prints_the_error_only_without_a_traceback(
 ) -> None:
     """dcc-mcp names every failure of code `RuntimeError`; its real type ends the traceback."""
     monkeypatch.setattr(cli, "select", lambda url: ("http://127.0.0.1:1/mcp", None))
-    monkeypatch.setattr(transport, "connect", lambda url, timeout, expected=None: tmp_path)
-    monkeypatch.setattr(transport, "execute", lambda url, code, timeout: result)
+    monkeypatch.setattr(transport, "connect", lambda url, timeout, expected=None, watch=None: tmp_path)
+    monkeypatch.setattr(transport, "execute", lambda url, code, timeout, watch=None: result)
     assert cli.main(["exec", "-c", "x"]) == cli.FAILED
     assert capsys.readouterr().err == printed
 
@@ -244,3 +245,115 @@ def test_a_slot_wait_below_0_is_refused(capsys: pytest.CaptureFixture[str], comm
     assert stopped.value.code == cli.NOT_RUN
     assert "takes 0 or more seconds" in capsys.readouterr().err
     assert cli.parser().parse_args([*command, "--slot-wait", "0"]).slot_wait == 0
+
+
+@pytest.mark.parametrize("value", ["0", "-5", "nan", "86401", "inf"])
+def test_exec_refuses_a_timeout_a_socket_cannot_take(capsys: pytest.CaptureFixture[str], value: str) -> None:
+    with pytest.raises(SystemExit):
+        cli.parser().parse_args(["exec", "-c", "1", "--timeout", value])
+    assert "takes more than 0 and at most 86400 seconds" in capsys.readouterr().err
+    assert cli.parser().parse_args(["exec", "-c", "1", "--timeout", "86400"]).timeout == 86400
+
+
+DIALOG = "Untrusted Plugin Loading - Security Warning"
+
+
+def on_a_dialog(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A session whose Maya shows the dialog; `select` finds it, so exec watches it."""
+    from maya_harness import process
+
+    target = Record(tmp_path, State("p", str(tmp_path), 1, 10, "http://127.0.0.1:1/mcp", time.time()))
+    (tmp_path / "work").mkdir()
+    monkeypatch.setattr(cli, "select", lambda url: (target.state.url, target))
+    monkeypatch.setattr(process, "modal_dialog", lambda pid, desktop=None: [DIALOG])
+
+
+def test_exec_on_a_modal_dialog_exits_1_with_its_title(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The code went to Maya: it runs on once the dialog is answered."""
+
+    def execute(url: str, code: str, timeout: float, watch: transport.Watch | None = None) -> transport.Result:
+        assert watch is not None and slots.in_call(tmp_path / "work") is not None  # status: busy
+        watch()
+        return transport.Result(True)
+
+    on_a_dialog(monkeypatch, tmp_path)
+    monkeypatch.setattr(transport, "connect", lambda url, timeout, expected=None, watch=None: tmp_path / "work")
+    monkeypatch.setattr(transport, "execute", execute)
+    assert cli.main(["exec", "-c", "1"]) == cli.FAILED
+    err = capsys.readouterr().err
+    assert DIALOG in err and "maya-harness stop http://127.0.0.1:1/mcp" in err
+    assert slots.in_call(tmp_path / "work") is None
+
+
+def test_exec_into_a_maya_already_on_a_dialog_exits_2(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The marker of connect waits on Maya's main thread too: only the watch ends that wait."""
+
+    def connect(url: str, timeout: float, expected: Path | None = None, watch: transport.Watch | None = None) -> Path:
+        assert watch is not None
+        watch()
+        return tmp_path / "work"
+
+    on_a_dialog(monkeypatch, tmp_path)
+    monkeypatch.setattr(transport, "connect", connect)
+    assert cli.main(["exec", "-c", "1"]) == cli.NOT_RUN
+    assert DIALOG in capsys.readouterr().err
+
+
+def test_status_tells_a_running_call_from_idleness_and_shows_the_windows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A call that hangs for minutes is not idleness: `last_call` is touched only around it."""
+    from maya_harness import process
+
+    item = Record(tmp_path, State("p", str(tmp_path), 1, 10, "http://127.0.0.1:1/mcp", time.time() - 600))
+    item.work.mkdir()
+    monkeypatch.setattr(session, "sessions", lambda temp: [item])
+    monkeypatch.setattr(process, "window_titles", lambda pid: [DIALOG, "untitled - Autodesk MAYA"])
+    assert cli.main(["status"]) == cli.OK
+    assert f"idle 10 min, windows [{DIALOG}, untitled - Autodesk MAYA]" in capsys.readouterr().out
+    (item.work / "in_call").write_text(json.dumps({"pid": os.getpid(), "since": time.time() - 540}), encoding="utf-8")
+    assert cli.main(["status"]) == cli.OK
+    assert "busy 9 min, windows [" in capsys.readouterr().out
+    assert cli.main(["status", "--json"]) == cli.OK
+    row = json.loads(capsys.readouterr().out)[0]
+    assert 539 <= row["busy"] <= 541 and row["windows"] == [DIALOG, "untitled - Autodesk MAYA"]
+
+
+def test_exec_waits_its_timeout_and_shows_signs_of_life(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """stderr even with --json: stdout stays one JSON line."""
+    from maya_harness import process
+
+    now = [0.0]
+    timeouts: list[float] = []
+
+    def connect(url: str, timeout: float, expected: Path | None = None, watch: transport.Watch | None = None) -> Path:
+        timeouts.append(timeout)
+        return tmp_path / "work"
+
+    def execute(url: str, code: str, timeout: float, watch: transport.Watch | None = None) -> transport.Result:
+        timeouts.append(timeout)
+        assert watch is not None
+        watch()
+        now[0] += cli.HEARTBEAT
+        watch()
+        return transport.Result(True, output="2")
+
+    target = Record(tmp_path, State("p", str(tmp_path), 1, 10, "http://127.0.0.1:1/mcp", time.time()))
+    (tmp_path / "work").mkdir()
+    monkeypatch.setattr(cli, "select", lambda url: (target.state.url, target))
+    monkeypatch.setattr(cli.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(process, "modal_dialog", lambda pid, desktop=None: [])
+    monkeypatch.setattr(process, "window_titles", lambda pid: ["untitled - Autodesk MAYA"])
+    monkeypatch.setattr(transport, "connect", connect)
+    monkeypatch.setattr(transport, "execute", execute)
+    assert cli.main(["exec", "-c", "1+1", "--timeout", "5", "--json"]) == cli.OK
+    assert timeouts == [5, 5]
+    out, err = capsys.readouterr()
+    assert json.loads(out)["output"] == "2"
+    assert err == f"waiting for Maya 10: {cli.HEARTBEAT} s, windows [untitled - Autodesk MAYA]\n"

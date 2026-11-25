@@ -3,6 +3,8 @@
 Exit codes: 0 — done; 1 — the code failed or a check did not pass; 2 — nothing was run: no
 Maya, no dcc-mcp module, no session, Maya did not start in time. An `exec` with no reply (a
 timeout, a reset, an unreadable reply) is 1: the code may have run; a refused connection is 2.
+A call cut short because Maya shows a modal dialog is 1 once the code went to Maya, and 2 when
+the connection (its handshake and marker) was cut short.
 `--json` prints one JSON line on stdout and nothing else there.
 """
 
@@ -24,7 +26,9 @@ from . import config, process, session, slots, transport
 from . import run as scenario_run
 from .session import Record
 
-CALL_TIMEOUT = 900  # seconds per `exec`
+CALL_TIMEOUT = 900  # seconds per `exec`, by default
+MAX_CALL_TIMEOUT = 86400  # a day: a longer wait is a typo, and past 2147483 s the socket overflows
+HEARTBEAT = 30  # seconds between the signs of life of an `exec` that waits for Maya
 DEFAULT_TTL = 60  # minutes
 PATCH_VARIABLE = "MAYA_HARNESS_DCC_MCP_PATCH"
 
@@ -38,7 +42,16 @@ def seconds(text: str) -> float:
     return value
 
 
-# Not --timeout: that would read as the time of a call.
+def call_seconds(text: str) -> float:
+    """The time of a call: a socket with timeout 0 is non-blocking, and connect fails with
+    WinError 10035; above 2147483 s (INT_MAX ms) `settimeout` raises OverflowError."""
+    value = float(text)
+    if not 0 < value <= MAX_CALL_TIMEOUT:
+        raise argparse.ArgumentTypeError(f"{text}: takes more than 0 and at most {MAX_CALL_TIMEOUT} seconds")
+    return value
+
+
+# Not --timeout: this is the wait for a slot, not the time of a call.
 SLOT_WAIT: dict[str, Any] = {
     "type": seconds,
     "metavar": "SEC",
@@ -86,6 +99,13 @@ def parser() -> argparse.ArgumentParser:
     )
     code.add_argument("-f", dest="file", type=Path, metavar="FILE", help="the code from a file")
     run.add_argument("--reload", action="store_true", help="drop the project's packages from sys.modules first")
+    run.add_argument(
+        "--timeout",
+        type=call_seconds,
+        default=CALL_TIMEOUT,
+        metavar="SEC",
+        help=f"give up waiting for the reply after this long, {CALL_TIMEOUT} by default",
+    )
     run.add_argument("--json", action="store_true")
 
     scenarios = commands.add_parser(
@@ -176,21 +196,47 @@ def reload_code(packages: Sequence[str]) -> str:
     )
 
 
+def heartbeat(pid: int, watch: transport.Watch) -> transport.Watch:
+    """`watch`, and every `HEARTBEAT` seconds a line on stderr: a long call is not taken for a hung
+    one. stderr with `--json` too: stdout stays one JSON line."""
+    begin = time.monotonic()
+    beaten = [begin]
+
+    def beat() -> None:
+        watch()
+        now = time.monotonic()
+        if now - beaten[0] >= HEARTBEAT:
+            beaten[0] = now
+            titles = ", ".join(process.window_titles(pid))
+            print(f"waiting for Maya {pid}: {round(now - begin)} s, windows [{titles}]", file=sys.stderr, flush=True)
+
+    return beat
+
+
 def run(args: argparse.Namespace) -> int:
     code = args.code if args.code is not None else args.file.read_text(encoding="utf-8")
     url, target = select(args.url)
     packages = config.load(Path.cwd()).reload if args.reload else ()
-    work = transport.connect(url, CALL_TIMEOUT, target.work if target else None)
+    # Only a Maya of a session: the pid of a Maya at a foreign address is unknown.
+    watch = heartbeat(target.state.maya_pid, session.watcher(target.state.maya_pid, url)) if target else None
+    # A connect cut short on a dialog is a TransportError out of `main`: the code was not sent.
+    work = transport.connect(url, args.timeout, target.work if target else None, watch)
     session.touch(work)
+    slots.begin_call(work)
     try:
         # A call of its own, not a prefix of the code: `from __future__` must open the code, and
         # the line numbers of its traceback must be the file's.
-        result = transport.execute(url, reload_code(packages), CALL_TIMEOUT) if packages else transport.Result(True)
+        result = (
+            transport.execute(url, reload_code(packages), args.timeout, watch) if packages else transport.Result(True)
+        )
         if result.success:
-            result = transport.execute(url, code, CALL_TIMEOUT)
+            result = transport.execute(url, code, args.timeout, watch)
     except OSError as error:  # a timeout, a reset: the code reached Maya and may have run
         result = transport.Result(False, type(error).__name__, stderr=f"no reply from {url}: {error}")
+    except transport.CallAborted as error:  # the code reached Maya and runs on after the dialog
+        result = transport.Result(False, type(error).__name__, stderr=str(error))
     finally:
+        slots.end_call(work)
         session.touch(work)
     if args.json:
         fields = ("success", "error", "stdout", "stderr", "output")
@@ -221,8 +267,10 @@ def run_scenarios(args: argparse.Namespace) -> int:
     codes = [scenario_run.code_of(item, project.scenarios.dir, project.reload) for item in runs]
     out = sys.stderr if args.json else sys.stdout
     if args.url:
-        work = transport.connect(args.url, CALL_TIMEOUT)
-        outcomes = scenario_run.run_at_url(args.url, work, runs, codes, out)
+        _, target = select(args.url)
+        watch = session.watcher(target.state.maya_pid, args.url) if target else None
+        work = transport.connect(args.url, CALL_TIMEOUT, None, watch)
+        outcomes = scenario_run.run_at_url(args.url, work, runs, codes, out, watch)
     else:
         count = 1 if args.visible else max(1, min(args.jobs, len(runs)))
         pool = scenario_run.run_in_pool(project, runs, codes, count, args.visible, temp_dir(), out, args.slot_wait)
@@ -256,9 +304,8 @@ def stop(args: argparse.Namespace) -> int:
     now = time.time()
     for item in targets:
         pid = item.state.maya_pid
-        titles = ", ".join(process.window_titles(pid))
-        idle = describe(item, now)["idle"] // 60
-        print(f"Maya {pid} {item.state.url} {item.state.project}: idle {idle} min, windows [{titles}]", flush=True)
+        row = describe(item, now)
+        print(f"Maya {pid} {item.state.url} {item.state.project}: {activity(row)}", flush=True)
         if process.kill_maya(pid, item.state.maya_created):
             shutil.rmtree(item.root, ignore_errors=True)
             print(f"Maya {pid}: killed")
@@ -269,11 +316,15 @@ def stop(args: argparse.Namespace) -> int:
 
 
 def describe(item: Record, now: float) -> dict[str, Any]:
+    """A session for `status` and `stop`: `busy` — the seconds of the running call, None when none
+    runs; `idle` — since the last call; `windows` — what Maya shows, a dialog on the hidden desktop
+    too."""
     last_call = item.work / "last_call"
     try:
         idle_since = last_call.stat().st_mtime
     except OSError:
         idle_since = item.state.started
+    since = slots.in_call(item.work)
     return {
         "project": item.state.project,
         "project_root": item.state.project_root,
@@ -281,9 +332,17 @@ def describe(item: Record, now: float) -> dict[str, Any]:
         "url": item.state.url,
         "age": round(now - item.state.started),
         "idle": round(now - idle_since),
+        "busy": None if since is None else round(now - since),
         "ttl": item.state.ttl,
         "dir": str(item.root),
+        "windows": process.window_titles(item.state.maya_pid),
     }
+
+
+def activity(row: dict[str, Any]) -> str:
+    """`busy` while a call runs, else `idle`, and Maya's windows."""
+    doing = f"idle {row['idle'] // 60} min" if row["busy"] is None else f"busy {row['busy'] // 60} min"
+    return f"{doing}, windows [{', '.join(row['windows'])}]"
 
 
 def status(args: argparse.Namespace) -> int:
@@ -297,7 +356,7 @@ def status(args: argparse.Namespace) -> int:
     for row in rows:
         print(
             f"{row['project']:<20} pid {row['pid']:<6} {row['url']:<28} "
-            f"age {row['age'] // 60} min, idle {row['idle'] // 60} min, ttl {row['ttl']} min  {row['project_root']}"
+            f"age {row['age'] // 60} min, ttl {row['ttl']} min  {row['project_root']}  {activity(row)}"
         )
     taken = slots.holders()
     print(f"Maya slots: {len(taken)} of {slots.count()} taken")

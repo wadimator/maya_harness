@@ -16,9 +16,9 @@
   taken: a free slot may keep the one of a dead Maya. A holder whose Maya is not alive is still
   starting: the slot is taken, its `.holder` not yet written.
 * A harness that waits says whom it waits for, on stderr (stdout of `--json` is one JSON line):
-  every holder, and for a Maya of `start` its idle time and how to free its slot. Again in full
-  when the holders change, else a line a minute. One `write` a message, with the pid of the
-  waiting harness: the workers of a pool wait at once.
+  every holder, and for a Maya of `start` its idle time or running call and how to free its
+  slot. Again in full when the holders change, else a line a minute. One `write` a message,
+  with the pid of the waiting harness: the workers of a pool wait at once.
 * Telling a taken slot from a free one means opening it, which takes a free slot for a moment:
   a harness that finds no free slot says so only when the next try finds none either.
 """
@@ -133,6 +133,29 @@ def try_take(directory: Path | None = None) -> Slot | None:
     return None
 
 
+def begin_call(work: Path) -> None:
+    """Marks a call as running, for `status`, `stop` and a harness waiting for a slot: the process
+    that waits for it, and since when."""
+    (work / "in_call").write_text(json.dumps({"pid": os.getpid(), "since": time.time()}), encoding="utf-8")
+
+
+def end_call(work: Path) -> None:
+    (work / "in_call").unlink(missing_ok=True)
+
+
+def in_call(work: Path) -> float | None:
+    """When the running call began; None when none runs. A call whose process is gone is none:
+    an `exec` killed in its wait leaves `in_call` behind, and Maya is not busy forever."""
+    try:
+        mark = json.loads((work / "in_call").read_text(encoding="utf-8"))
+        pid, since = mark["pid"], mark["since"]
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+    if not isinstance(pid, int) or not isinstance(since, int | float) or not process.process_alive(pid):
+        return None
+    return float(since)
+
+
 @dataclass(frozen=True)
 class Holder:
     """Who holds a taken slot, from its `.holder`; `pid` 0 for a Maya still starting."""
@@ -151,11 +174,16 @@ class Holder:
             return f"slot {self.number}: a Maya starting"
         text = f"slot {self.number}: Maya {self.pid} {self.project}, {self.command}, {(now - self.since) // 60:.0f} min"
         if self.command == "start":
-            try:
-                idle_since = (Path(self.work) / "last_call").stat().st_mtime
-            except OSError:
-                idle_since = self.since
-            text += f", idle {(now - idle_since) // 60:.0f} min; free it: maya-harness stop {self.url}"
+            busy_since = in_call(Path(self.work))
+            if busy_since is not None:
+                doing = f"busy {(now - busy_since) // 60:.0f} min"
+            else:
+                try:
+                    idle_since = (Path(self.work) / "last_call").stat().st_mtime
+                except OSError:
+                    idle_since = self.since
+                doing = f"idle {(now - idle_since) // 60:.0f} min"
+            text += f", {doing}; free it: maya-harness stop {self.url}"
         return text
 
 

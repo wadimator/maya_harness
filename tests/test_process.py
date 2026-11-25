@@ -5,6 +5,8 @@ import threading
 from collections.abc import Callable
 from pathlib import Path
 
+import pytest
+
 from maya_harness import process
 from maya_harness.process import affinity_mask, environment_block
 
@@ -105,3 +107,23 @@ def test_a_released_maya_takes_what_it_started_along_when_killed(stub: Callable[
     finally:
         process.kernel32.TerminateProcess(grandchild, 1)
         process.kernel32.CloseHandle(grandchild)
+
+
+def test_modal_dialog_is_the_other_windows_while_the_main_window_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dialog that has no title yet is not one: `confirmDialog` disables the window first."""
+    main = (1, "untitled - Autodesk MAYA 2025.3.1: untitled")
+    windows = [main]
+    enabled = [True]
+    monkeypatch.setattr(process, "_windows", lambda pid, desktop: windows)
+    monkeypatch.setattr(process.user32, "IsWindowEnabled", lambda window: enabled[0])
+    windows.append((2, "Script Editor"))
+    assert process.modal_dialog(10) == []
+    enabled[0] = False
+    windows.remove((2, "Script Editor"))
+    assert process.modal_dialog(10) == []
+    windows.append((3, "Untrusted Plugin Loading - Security Warning"))
+    assert process.modal_dialog(10) == ["Untrusted Plugin Loading - Security Warning"]
+    windows.remove(main)
+    assert process.modal_dialog(10) == []

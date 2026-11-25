@@ -15,6 +15,9 @@
   with dcc-mcp-maya 0.9.43: the refusal is `structuredContent` `{"success": false, "error":
   "maya-busy", "message": ..., "context": {}}`, with `isError: true` next to it.
 * A call has a timeout of its own, so the caller can share one deadline between its calls.
+* While a reply is awaited, the caller's `watch` is called every `WATCH_EVERY` seconds: what to
+  look at is the caller's business (a modal dialog of its Maya), this module knows only dcc-mcp.
+  A `watch` that raises cuts the wait short; the code may run on in Maya.
 """
 
 from __future__ import annotations
@@ -37,10 +40,17 @@ BUSY_RETRY = 0.5  # seconds between the repeats of a call refused with maya-busy
 STARTUP_TIMEOUT = 180  # seconds for a Maya to start and connect; a cold start takes 12-15
 LOG_DIR = Path(os.environ.get("LOCALAPPDATA", "")) / "dcc-mcp" / "log"
 MARKER_CODE = "import json, os\njson.dumps(os.environ.get('MAYA_HARNESS_WORK', ''))"
+WATCH_EVERY = 2.0  # seconds between the calls of `watch` while a reply is awaited
+
+Watch = Callable[[], None]
 
 
 class TransportError(RuntimeError):
     """The call did not reach Maya, or Maya is not a session of maya_harness."""
+
+
+class CallAborted(TransportError):
+    """The caller's `watch` cut the wait for a reply short: the code may have run, and may run on."""
 
 
 class ReplyError(OSError):
@@ -105,9 +115,9 @@ def wait_for_server(url: str, work: Path, running: Callable[[], bool], timeout: 
     raise TimeoutError(f"No dcc-mcp server at {url} after {timeout:.0f} s; {startup}.")
 
 
-def read_in_background(request: urllib.request.Request, timeout: float) -> str:
+def read_in_background(request: urllib.request.Request, timeout: float, watch: Watch | None = None) -> str:
     """The reply read in a thread: on Windows a blocking socket read holds Ctrl+C until the reply
-    comes, and waiting on the thread lets Ctrl+C through.
+    comes, and waiting on the thread lets Ctrl+C through, and `watch` too.
 
     Check Ctrl+C from PowerShell: processes started from Git Bash ignore it, and the check passes
     falsely."""
@@ -122,14 +132,25 @@ def read_in_background(request: urllib.request.Request, timeout: float) -> str:
 
     thread = threading.Thread(target=read, daemon=True)
     thread.start()
+    watched = time.monotonic()
     while thread.is_alive():
         thread.join(0.2)
+        if watch is not None and thread.is_alive() and time.monotonic() - watched >= WATCH_EVERY:
+            watch()
+            watched = time.monotonic()
     if isinstance(outcome[0], BaseException):
         raise outcome[0]
     return outcome[0]
 
 
-def call(url: str, method: str, params: dict[str, object], request_id: int | None, timeout: float) -> dict[str, Any]:
+def call(
+    url: str,
+    method: str,
+    params: dict[str, object],
+    request_id: int | None,
+    timeout: float,
+    watch: Watch | None = None,
+) -> dict[str, Any]:
     message: dict[str, object] = {"jsonrpc": "2.0", "method": method, "params": params}
     if request_id is not None:
         message["id"] = request_id
@@ -139,7 +160,7 @@ def call(url: str, method: str, params: dict[str, object], request_id: int | Non
         headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
     )
     try:
-        body = read_in_background(request, timeout)
+        body = read_in_background(request, timeout, watch)
         reply = json.loads(body) if request_id is not None and body else {}
     except (urllib.error.HTTPError, ConnectionError):  # Maya answered or hung up: the code may have run
         raise
@@ -163,9 +184,9 @@ def result_type(code: str) -> str:
     return "JSON" if body and isinstance(body[-1], ast.Expr) else "NONE"
 
 
-def _execute_once(url: str, code: str, timeout: float) -> dict[str, Any]:
+def _execute_once(url: str, code: str, timeout: float, watch: Watch | None = None) -> dict[str, Any]:
     arguments = {"code": code, "result_type": result_type(code), "capture_output": True}
-    reply = call(url, "tools/call", {"name": "execute_python", "arguments": arguments}, 2, timeout)
+    reply = call(url, "tools/call", {"name": "execute_python", "arguments": arguments}, 2, timeout, watch)
     if "error" in reply:  # the server refused the call itself, e.g. an unknown tool
         return {"success": False, "error": json.dumps(reply["error"], ensure_ascii=False)}
     content: dict[str, Any] = reply.get("result", {}).get("structuredContent", {})
@@ -190,14 +211,15 @@ def to_result(content: dict[str, Any]) -> Result:
     )
 
 
-def execute(url: str, code: str, timeout: float) -> Result:
-    """Runs `code` in the Maya at `url`; a maya-busy refusal is repeated until `timeout` runs out."""
+def execute(url: str, code: str, timeout: float, watch: Watch | None = None) -> Result:
+    """Runs `code` in the Maya at `url`; a maya-busy refusal is repeated until `timeout` runs out.
+    `watch` that raises cuts the wait for a reply short."""
     deadline = time.monotonic() + timeout
     while True:
         left = deadline - time.monotonic()
         if left <= 0:
             raise TransportError(f"no time left for a call to {url}")
-        content = _execute_once(url, code, left)
+        content = _execute_once(url, code, left, watch)
         if not is_busy(content):
             return to_result(content)
         if deadline - time.monotonic() <= BUSY_RETRY:
@@ -205,19 +227,21 @@ def execute(url: str, code: str, timeout: float) -> Result:
         time.sleep(BUSY_RETRY)
 
 
-def connect(url: str, timeout: float, work: Path | None = None) -> Path:
+def connect(url: str, timeout: float, work: Path | None = None, watch: Watch | None = None) -> Path:
     """The handshake, then the marker: a session's Maya holds its work directory there, and the
     Maya a session started must hold its own one — a port another Maya took would run the code
-    there. Returns the work directory of that Maya."""
+    there. Returns the work directory of that Maya. The marker goes to Maya's main thread like
+    any code: a Maya on a modal dialog holds it, and only `watch` cuts that wait short."""
     call(
         url,
         "initialize",
         {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "maya_harness"}},
         1,
         timeout,
+        watch,
     )
-    call(url, "notifications/initialized", {}, None, timeout)
-    result = execute(url, MARKER_CODE, timeout)
+    call(url, "notifications/initialized", {}, None, timeout, watch)
+    result = execute(url, MARKER_CODE, timeout, watch)
     if not result.success:
         raise TransportError(f"{url} did not check its marker: {result.error or result.raw}")
     marker = result.value()
