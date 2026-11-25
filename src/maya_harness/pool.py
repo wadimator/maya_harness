@@ -10,8 +10,8 @@
   the end: a worker that cannot start its Maya yet (every slot of the machine is taken, see
   `slots`) holds up no other, and a Maya with nothing left to run holds nothing up to the end of
   the run. A worker that waits for a slot gives up once no run is left or the run is stopped.
-* Mayas at once: on 8 cores / 16 threads 3 Mayas slow a scenario by 14%, 4 by 19%, 7 by 16-60%
-  (Retarget_Master, 2026).
+* Mayas at once: on 8 cores / 16 threads a Maya of a scenario takes ~1.2 cores: 6 Mayas run
+  `all` in 494 s against 791 s for 3, 8 Mayas in 475 s (2026-11).
 """
 
 from __future__ import annotations
@@ -28,8 +28,8 @@ from typing import TextIO
 from . import call, config, session, transport
 from .scenarios import Outcome, Run, label_of, print_summary, verdict
 
-JOBS = 3
-MAX_JOBS = 4
+JOBS = 6
+MAX_JOBS = 6
 TIMEOUT = 900  # seconds per scenario: a run may reopen scenes with heavy rigs
 
 

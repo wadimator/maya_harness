@@ -39,7 +39,7 @@ from . import call, process, win32
 
 DIR = Path(tempfile.gettempdir()) / "maya_harness" / "slots"
 VARIABLE = "MAYA_HARNESS_SLOTS"
-DEFAULT_COUNT = 4  # more than 4 Mayas on 8 cores / 16 threads slow each other down (Retarget_Master)
+DEFAULT_COUNT = 6  # on 8 cores / 16 threads 6 Mayas run `all` in 494 s, 3 in 791 s, 8 in 475 s
 POLL = 0.5  # seconds between the tries of a harness that waits for a slot
 REMINDER = 60  # seconds between the lines of a harness that still waits
 

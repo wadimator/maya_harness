@@ -226,7 +226,7 @@ def test_status_shows_the_slots_in_text_only(
     try:
         assert cli.main(["status"]) == cli.OK
         out = capsys.readouterr().out
-        assert "Maya slots: 1 of 4 taken\n  slot 1: a Maya starting\n" in out
+        assert "Maya slots: 1 of 6 taken\n  slot 1: a Maya starting\n" in out
         assert cli.main(["status", "--json"]) == cli.OK
         assert json.loads(capsys.readouterr().out) == []
     finally:
