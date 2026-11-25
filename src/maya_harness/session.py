@@ -1,15 +1,10 @@
 """A session: the directory, environment and state of one Maya the harness started.
 
-* Every session has its own directory `%TEMP%/maya_harness_<project>_<pid>_*`:
-  `app/` is `MAYA_APP_DIR` with the `userSetup.py` that loads dcc-mcp, `modules/` holds a copy
-  of the dcc-mcp `.mod`, `appdata/` is `APPDATA`, `work/` holds what the session writes itself.
-  Two Mayas with one `MAYA_APP_DIR` break each other's FBX import: `FBXPushSettings` writes a
-  file there («Read settings failed»).
-* `state.json` in the directory names its project, the harness and Maya pids and the address.
-  `status`, `exec` and the cleanup read it, not the directory name: after the prefix comes the
-  project, and a project name with `_` in it (`Retarget_Master`) cannot be split into a pid.
-* A directory is kept while its harness or its Maya is alive. One without a readable
-  `state.json` is removed only a day after it was made: a fresh one may not have written it yet.
+* Every session has its own directory (`registry`): `app/` is `MAYA_APP_DIR` with the
+  `userSetup.py` that loads dcc-mcp, `modules/` holds a copy of the dcc-mcp `.mod`, `appdata/`
+  is `APPDATA`, `work/` holds what the session writes itself. Two Mayas with one `MAYA_APP_DIR`
+  break each other's FBX import: `FBXPushSettings` writes a file there («Read settings
+  failed»). A session that outlives its harness is found by its `state.json` (`registry`).
 * The environment is the user's minus everything that tells Maya or Python where to find code
   (`MAYA_*`, `PYTHONPATH`, `PYTHONHOME`, `PYTHONSTARTUP`, `VIRTUAL_ENV`); `PATH` stays as it is.
   `APPDATA` is the session's own: plugins keep their settings there (studiolibrary does), and a
@@ -47,26 +42,21 @@
 from __future__ import annotations
 
 import itertools
-import json
 import os
 import shutil
 import socket
 import tempfile
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 
-from . import call, inmaya, process, slots, transport
-from .process import maya_alive, process_alive
+from . import call, inmaya, process, registry, slots, transport
 
-PREFIX = "maya_harness_"
 NUMBERS = itertools.count(1)  # of the Mayas `start` starts: each gets a desktop of its own
-STATE_FILE = "state.json"
 PROJECT_VARIABLE = "MAYA_HARNESS_PROJECT"
 MODULE_VARIABLE = "MAYA_HARNESS_DCC_MCP_MOD"
 DEFAULT_MAYA = Path(r"C:\Program Files\Autodesk\Maya2025")
-UNCLAIMED_AGE = 24 * 60 * 60  # seconds a directory without a readable state.json is kept
 STARTUP_TIMEOUT = 180  # seconds for a Maya to start and connect; a cold start takes 12-15
 STARTUP_POLL = 0.25  # seconds between the looks at a starting Maya
 BOOTSTRAP_LOG = "dcc_mcp_bootstrap.jsonl"  # in the work directory: what dcc-mcp did while it loaded
@@ -95,32 +85,6 @@ class SessionParams:
     sys_path: tuple[Path, ...] = ()
     plugins: tuple[str, ...] = ()
     plug_in_path: tuple[Path, ...] = ()
-
-
-@dataclass(frozen=True)
-class State:
-    """The contents of `state.json`. `started` is seconds since the epoch, `ttl` minutes."""
-
-    project: str
-    project_root: str
-    runner_pid: int
-    maya_pid: int
-    url: str
-    started: float
-    ttl: int
-    maya_created: int
-
-
-@dataclass(frozen=True)
-class Record:
-    """A session found on disk: its directory and its state.json."""
-
-    root: Path
-    state: State
-
-    @property
-    def work(self) -> Path:
-        return self.root / "work"
 
 
 class StartError(Exception):
@@ -247,72 +211,9 @@ def free_port() -> int:
         return int(probe.getsockname()[1])
 
 
-def read_state(root: Path) -> State | None:
-    """The state of the session in `root`; None when `state.json` is missing, broken or holds a
-    pid that is not a number."""
-    try:
-        data = json.loads((root / STATE_FILE).read_text(encoding="utf-8"))
-        state = State(
-            project=str(data["project"]),
-            project_root=str(data["project_root"]),
-            runner_pid=data["runner_pid"],
-            maya_pid=data["maya_pid"],
-            url=str(data["url"]),
-            started=float(data["started"]),
-            ttl=int(data["ttl"]),
-            maya_created=int(data["maya_created"]),
-        )
-    except (OSError, ValueError, TypeError, KeyError, AttributeError):
-        return None
-    pids = (state.runner_pid, state.maya_pid)
-    if not all(isinstance(pid, int) and not isinstance(pid, bool) for pid in pids):
-        return None
-    return state
-
-
-def write_state(root: Path, state: State) -> None:
-    (root / STATE_FILE).write_text(json.dumps(asdict(state), ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def remove_stale(
-    temp: Path,
-    alive: Callable[[int], bool] = process_alive,
-    now: Callable[[], float] = time.time,
-    maya: Callable[[int, int], bool] = maya_alive,
-) -> list[Path]:
-    """Removes the session directories nobody holds; returns them."""
-    removed = []
-    for root in temp.glob(f"{PREFIX}*"):
-        if not root.is_dir():
-            continue
-        state = read_state(root)
-        if state is None:
-            try:
-                fresh = now() - root.stat().st_mtime < UNCLAIMED_AGE
-            except OSError:
-                continue
-            if fresh:
-                continue
-        elif alive(state.runner_pid) or maya(state.maya_pid, state.maya_created):
-            continue
-        shutil.rmtree(root, ignore_errors=True)
-        removed.append(root)
-    return removed
-
-
-def sessions(temp: Path, maya: Callable[[int, int], bool] = maya_alive) -> list[Record]:
-    """The sessions whose Maya is alive, the latest started last."""
-    found = []
-    for root in temp.glob(f"{PREFIX}*"):
-        state = read_state(root) if root.is_dir() else None
-        if state is not None and maya(state.maya_pid, state.maya_created):
-            found.append(Record(root, state))
-    return sorted(found, key=lambda session: session.state.started)
-
-
 def make_session_dir(project: str, temp: Path) -> Path:
-    remove_stale(temp)
-    return Path(tempfile.mkdtemp(prefix=f"{PREFIX}{project}_{os.getpid()}_", dir=temp))
+    registry.remove_stale(temp)
+    return Path(tempfile.mkdtemp(prefix=f"{registry.PREFIX}{project}_{os.getpid()}_", dir=temp))
 
 
 def environment(base: Mapping[str, str], root: Path, params: SessionParams, port: int, ttl: int = 0) -> dict[str, str]:
@@ -429,7 +330,7 @@ def start(
         for log in transport.server_logs(maya.pid):  # Windows reuses pids: a stale log holds a stale address
             log.unlink(missing_ok=True)
         if record:
-            state = State(
+            state = registry.State(
                 params.project,
                 str(params.project_root),
                 os.getpid(),
@@ -439,7 +340,7 @@ def start(
                 ttl,
                 maya.created,
             )
-            write_state(root, state)
+            registry.write_state(root, state)
     except BaseException:
         started.close()
         slot.release()

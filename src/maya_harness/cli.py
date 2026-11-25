@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -22,9 +21,9 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from . import call, config, process, session, slots, transport
+from . import call, config, process, registry, session, slots, transport
 from . import run as scenario_run
-from .session import Record
+from .registry import Record
 
 CALL_TIMEOUT = 900  # seconds per `exec`, by default
 MAX_CALL_TIMEOUT = 86400  # a day: a longer wait is a typo, and past 2147483 s the socket overflows
@@ -168,22 +167,17 @@ def start(args: argparse.Namespace) -> int:
     return OK
 
 
-def find_project_sessions(found: list[Record], root: Path) -> list[Record]:
-    """The sessions started from the project at `root`, the latest last. By the project root, not
-    the project name: a worktree has the same name, and its Maya has the other tree on sys.path."""
-    return [item for item in found if Path(item.state.project_root) == root]
-
-
 def select(url: str | None) -> tuple[str, Record | None]:
-    """The address to call: `url`, or the latest live session of the project here."""
-    found = session.sessions(temp_dir())
+    """The address to call: `url`, or the latest live session of the project here. The project's
+    config is read only without `url`: `exec <url>` runs from any directory."""
+    found = registry.running(temp_dir())
+    root = None if url else config.load(Path.cwd()).root
+    record = registry.select(found, url, root)
     if url:
-        return url, next((item for item in found if item.state.url == url), None)
-    root = config.load(Path.cwd()).root
-    mine = find_project_sessions(found, root)
-    if not mine:
+        return url, record
+    if record is None:
         raise NotRun(f"no running Maya of the project at {root}; `maya-harness start` first")
-    return mine[-1].state.url, mine[-1]
+    return record.state.url, record
 
 
 def reload_code(packages: Sequence[str]) -> str:
@@ -273,17 +267,17 @@ def run_scenarios(args: argparse.Namespace) -> int:
 
 
 def stop(args: argparse.Namespace) -> int:
-    found = session.sessions(temp_dir())
+    found = registry.running(temp_dir())
     if args.all_mine:
         targets = found
     elif args.project:
-        targets = find_project_sessions(found, config.load(Path.cwd()).root)
+        targets = registry.of_project(found, config.load(Path.cwd()).root)
     elif args.url:
         targets = [item for item in found if item.state.url == args.url]
         if not targets:
             raise NotRun(f"no Maya of maya_harness at {args.url}")
     else:
-        targets = find_project_sessions(found, config.load(Path.cwd()).root)[-1:]
+        targets = registry.of_project(found, config.load(Path.cwd()).root)[-1:]
     if not targets:
         print("no running Maya to stop")
         return OK
@@ -294,34 +288,14 @@ def stop(args: argparse.Namespace) -> int:
     now = time.time()
     for item in targets:
         pid = item.state.maya_pid
-        row = describe(item, now)
+        row = registry.describe(item, now)
         print(f"Maya {pid} {item.state.url} {item.state.project}: {activity(row)}", flush=True)
-        if process.kill_maya(pid, item.state.maya_created):
-            shutil.rmtree(item.root, ignore_errors=True)
+        if registry.stop(item):
             print(f"Maya {pid}: killed")
         else:  # the directory stays: its logs tell why
             running = True
             print(f"Maya {pid}: still running")
     return FAILED if running else OK
-
-
-def describe(item: Record, now: float) -> dict[str, Any]:
-    """A session for `status` and `stop`: `busy` — the seconds of the running call, None when none
-    runs; `idle` — since the last call; `windows` — what Maya shows, a dialog on the hidden desktop
-    too."""
-    since, idle_since = call.activity(item.work, item.state.started)
-    return {
-        "project": item.state.project,
-        "project_root": item.state.project_root,
-        "pid": item.state.maya_pid,
-        "url": item.state.url,
-        "age": round(now - item.state.started),
-        "idle": round(now - idle_since),
-        "busy": None if since is None else round(now - since),
-        "ttl": item.state.ttl,
-        "dir": str(item.root),
-        "windows": process.window_titles(item.state.maya_pid),
-    }
 
 
 def activity(row: dict[str, Any]) -> str:
@@ -332,7 +306,7 @@ def activity(row: dict[str, Any]) -> str:
 
 def status(args: argparse.Namespace) -> int:
     now = time.time()
-    rows = [describe(item, now) for item in session.sessions(temp_dir())]
+    rows = [registry.describe(item, now) for item in registry.running(temp_dir())]
     if args.json:
         print(json.dumps(rows, ensure_ascii=False))
         return OK

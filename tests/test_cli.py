@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from maya_harness import call, cli, session, transport
-from maya_harness.session import Record, State
+from maya_harness import call, cli, registry, session, transport
+from maya_harness.registry import Record, State
 
 
 def make(root: str, started: float, project: str = "ue_exporter") -> Record:
@@ -44,7 +44,7 @@ def test_exec_picks_the_latest_session_of_its_own_root(monkeypatch: pytest.Monke
         root.mkdir(parents=True)
         (root / "pyproject.toml").write_text('[project]\nname = "ue_exporter"\n', encoding="utf-8")
     older, own, newer_other = make(str(clone), 1), make(str(clone), 2), make(str(worktree), 3)
-    monkeypatch.setattr(session, "sessions", lambda temp: [older, own, newer_other])
+    monkeypatch.setattr(registry, "running", lambda temp: [older, own, newer_other])
     monkeypatch.chdir(clone)
     assert cli.select(None) == (own.state.url, own)
     monkeypatch.chdir(worktree)
@@ -52,7 +52,7 @@ def test_exec_picks_the_latest_session_of_its_own_root(monkeypatch: pytest.Monke
 
 
 def test_exec_without_a_session_of_its_root_runs_nothing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(session, "sessions", lambda temp: [make(str(tmp_path / "other"), 1)])
+    monkeypatch.setattr(registry, "running", lambda temp: [make(str(tmp_path / "other"), 1)])
     monkeypatch.chdir(tmp_path)
     with pytest.raises(cli.NotRun, match="no running Maya"):
         cli.select(None)
@@ -60,7 +60,7 @@ def test_exec_without_a_session_of_its_root_runs_nothing(monkeypatch: pytest.Mon
 
 def test_exec_at_a_url_takes_its_session_when_there_is_one(monkeypatch: pytest.MonkeyPatch) -> None:
     known = make("C:/p", 7)
-    monkeypatch.setattr(session, "sessions", lambda temp: [known])
+    monkeypatch.setattr(registry, "running", lambda temp: [known])
     assert cli.select(known.state.url) == (known.state.url, known)
     assert cli.select("http://127.0.0.1:9/mcp") == ("http://127.0.0.1:9/mcp", None)
 
@@ -149,7 +149,7 @@ def test_stop_kills_at_once_and_keeps_the_directory_of_a_maya_still_running(
         raise AssertionError("stop called Maya")
 
     stuck, killed = target(10), target(20)
-    monkeypatch.setattr(session, "sessions", lambda temp: [stuck, killed])
+    monkeypatch.setattr(registry, "running", lambda temp: [stuck, killed])
     monkeypatch.setattr(call, "connect", no_call)
     monkeypatch.setattr(transport, "execute", no_call)
     monkeypatch.setattr(process, "window_titles", lambda pid: ["Maya-2025"])
@@ -221,7 +221,7 @@ def test_status_shows_the_slots_in_text_only(
 ) -> None:
     from maya_harness import slots
 
-    monkeypatch.setattr(session, "sessions", lambda temp: [])
+    monkeypatch.setattr(registry, "running", lambda temp: [])
     held = slots.take(0)
     try:
         assert cli.main(["status"]) == cli.OK
@@ -307,7 +307,7 @@ def test_status_tells_a_running_call_from_idleness_and_shows_the_windows(
 
     item = Record(tmp_path, State("p", str(tmp_path), 1, 10, "http://127.0.0.1:1/mcp", time.time() - 600, 0, 1))
     item.work.mkdir()
-    monkeypatch.setattr(session, "sessions", lambda temp: [item])
+    monkeypatch.setattr(registry, "running", lambda temp: [item])
     monkeypatch.setattr(process, "window_titles", lambda pid: [DIALOG, "untitled - Autodesk MAYA"])
     assert cli.main(["status"]) == cli.OK
     assert f"idle 10 min, windows [{DIALOG}, untitled - Autodesk MAYA]" in capsys.readouterr().out

@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from maya_harness import call, cli, config, inmaya, session, slots, win32
+from maya_harness import call, cli, config, inmaya, registry, session, slots, win32
 from maya_harness import run as scenario_run
 from maya_harness.run import Run
 
@@ -353,7 +353,7 @@ def test_run_at_url_fails_the_run_maya_did_not_answer(
             return reply
         raise scenario_run.transport.TransportError("Maya at x stayed maya-busy")
 
-    monkeypatch.setattr(scenario_run.session, "sessions", lambda temp: [])
+    monkeypatch.setattr(registry, "running", lambda temp: [])
     monkeypatch.setattr(call, "connect", lambda url, timeout, **_: call.Target(url, tmp_path))
     monkeypatch.setattr(scenario_run.transport, "execute", execute)
     assert cli.main(["run", "--url", "http://x", "all"]) == cli.FAILED
@@ -513,7 +513,7 @@ def test_run_at_url_fails_the_run_that_stands_on_a_dialog(
 def test_run_at_url_watches_the_maya_of_the_session_at_that_address(
     monkeypatch: pytest.MonkeyPatch, project: Path, tmp_path: Path
 ) -> None:
-    target = session.Record(tmp_path, session.State("p", str(tmp_path), 10, 1, "http://x", 0.0, 0, 1))
+    target = registry.Record(tmp_path, registry.State("p", str(tmp_path), 10, 1, "http://x", 0.0, 0, 1))
     watched: list[object] = []
 
     def watch() -> None:
@@ -523,7 +523,7 @@ def test_run_at_url_watches_the_maya_of_the_session_at_that_address(
         watched.append(watch)
         return scenario_run.transport.Result(True, "", output='{"failures": []}')
 
-    monkeypatch.setattr(scenario_run.session, "sessions", lambda temp: [target])
+    monkeypatch.setattr(registry, "running", lambda temp: [target])
     monkeypatch.setattr(call, "watcher", lambda pid, url, desktop=None: watch)
     monkeypatch.setattr(call, "connect", lambda url, timeout, pid=None, **_: call.Target(url, tmp_path, pid))
     monkeypatch.setattr(scenario_run.transport, "execute", execute)
