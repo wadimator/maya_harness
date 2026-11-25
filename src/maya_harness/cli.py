@@ -249,7 +249,10 @@ def run_scenarios(args: argparse.Namespace) -> int:
     if args.jobs < 1:
         raise NotRun("--jobs takes 1 or more")
     if args.jobs > pool.MAX_JOBS:
-        print(f"--jobs {args.jobs}: more than {pool.MAX_JOBS} Mayas slow each other down.", file=sys.stderr)
+        print(
+            f"--jobs {args.jobs}: more than {pool.MAX_JOBS} Mayas gain little on 8 cores and take ~1.8 GB each.",
+            file=sys.stderr,
+        )
     codes = [scenarios.code_of(item, project.scenarios.dir, project.reload) for item in runs]
     out = sys.stderr if args.json else sys.stdout
     if args.url:
