@@ -45,7 +45,6 @@ def test_maya_alive_needs_the_recorded_creation_time(tmp_path: Path) -> None:
         created = win32.creation_time(handle)
         assert process.maya_alive(child.pid, created)
         assert not process.maya_alive(child.pid, created + 1)
-        assert process.maya_alive(child.pid, 0)  # an old state.json: the pid decides
     finally:
         child.kill()
         child.wait(5)
@@ -63,7 +62,6 @@ def test_kill_maya_kills_only_our_maya(tmp_path: Path) -> None:
     try:
         created = win32.creation_time(handle)
         assert process.kill_maya(child.pid, created + 1)  # the pid names another process: ours is gone
-        assert not process.kill_maya(child.pid, 0)  # an old state.json: cannot tell
         assert child.poll() is None
         assert process.kill_maya(child.pid, created)
         assert child.wait(5) == 1

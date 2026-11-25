@@ -142,8 +142,8 @@ class State:
     maya_pid: int
     url: str
     started: float
-    ttl: int = 0
-    maya_created: int = 0
+    ttl: int
+    maya_created: int
 
 
 @dataclass(frozen=True)
@@ -280,8 +280,8 @@ def read_state(root: Path) -> State | None:
             maya_pid=data["maya_pid"],
             url=str(data["url"]),
             started=float(data["started"]),
-            ttl=int(data.get("ttl", 0)),
-            maya_created=int(data.get("maya_created", 0)),
+            ttl=int(data["ttl"]),
+            maya_created=int(data["maya_created"]),
         )
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         return None

@@ -10,7 +10,7 @@ from maya_harness.session import Record, State
 
 
 def make(root: str, started: float, project: str = "ue_exporter") -> Record:
-    state = State(project, str(Path(root)), 1, 2, f"http://127.0.0.1:{int(started)}/mcp", started)
+    state = State(project, str(Path(root)), 1, 2, f"http://127.0.0.1:{int(started)}/mcp", started, 0, 1)
     return Record(Path("C:/temp") / f"maya_harness_{started}", state)
 
 
@@ -147,7 +147,7 @@ def test_stop_kills_at_once_and_keeps_the_directory_of_a_maya_still_running(
     def target(pid: int) -> Record:
         root = tmp_path / f"maya_harness_{pid}"
         root.mkdir()
-        return Record(root, State("p", "C:/p", 1, pid, f"http://127.0.0.1:{pid}/mcp", time.time(), maya_created=pid))
+        return Record(root, State("p", "C:/p", 1, pid, f"http://127.0.0.1:{pid}/mcp", time.time(), 0, pid))
 
     def no_call(*args: object) -> None:
         raise AssertionError("stop called Maya")
@@ -262,7 +262,7 @@ def on_a_dialog(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """A session whose Maya shows the dialog; `select` finds it, so exec watches it."""
     from maya_harness import process
 
-    target = Record(tmp_path, State("p", str(tmp_path), 1, 10, "http://127.0.0.1:1/mcp", time.time()))
+    target = Record(tmp_path, State("p", str(tmp_path), 1, 10, "http://127.0.0.1:1/mcp", time.time(), 0, 1))
     (tmp_path / "work").mkdir()
     monkeypatch.setattr(cli, "select", lambda url: (target.state.url, target))
     monkeypatch.setattr(process, "modal_dialog", lambda pid, desktop=None: [DIALOG])
@@ -309,7 +309,7 @@ def test_status_tells_a_running_call_from_idleness_and_shows_the_windows(
     """A call that hangs for minutes is not idleness: `last_call` is touched only around it."""
     from maya_harness import process
 
-    item = Record(tmp_path, State("p", str(tmp_path), 1, 10, "http://127.0.0.1:1/mcp", time.time() - 600))
+    item = Record(tmp_path, State("p", str(tmp_path), 1, 10, "http://127.0.0.1:1/mcp", time.time() - 600, 0, 1))
     item.work.mkdir()
     monkeypatch.setattr(session, "sessions", lambda temp: [item])
     monkeypatch.setattr(process, "window_titles", lambda pid: [DIALOG, "untitled - Autodesk MAYA"])
@@ -344,7 +344,7 @@ def test_exec_waits_its_timeout_and_shows_signs_of_life(
         watch()
         return transport.Result(True, output="2")
 
-    target = Record(tmp_path, State("p", str(tmp_path), 1, 10, "http://127.0.0.1:1/mcp", time.time()))
+    target = Record(tmp_path, State("p", str(tmp_path), 1, 10, "http://127.0.0.1:1/mcp", time.time(), 0, 1))
     (tmp_path / "work").mkdir()
     monkeypatch.setattr(cli, "select", lambda url: (target.state.url, target))
     monkeypatch.setattr(cli.time, "monotonic", lambda: now[0])

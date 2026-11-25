@@ -517,7 +517,7 @@ def test_run_at_url_fails_the_run_that_stands_on_a_dialog(
 def test_run_at_url_watches_the_maya_of_the_session_at_that_address(
     monkeypatch: pytest.MonkeyPatch, project: Path, tmp_path: Path
 ) -> None:
-    target = session.Record(tmp_path, session.State("p", str(tmp_path), 10, 1, "http://x", 0.0))
+    target = session.Record(tmp_path, session.State("p", str(tmp_path), 10, 1, "http://x", 0.0, 0, 1))
     watched: list[object] = []
 
     def watch() -> None:

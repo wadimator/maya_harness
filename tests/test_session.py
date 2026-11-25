@@ -22,7 +22,7 @@ def maya(pid: int, created: int) -> bool:
     return alive(pid)
 
 
-def make_dir(temp: Path, runner_pid: object, maya_pid: object, *, age: float = 0.0, created: int = 0) -> Path:
+def make_dir(temp: Path, runner_pid: object, maya_pid: object, *, age: float = 0.0, created: int = 1) -> Path:
     root = temp / f"{session.PREFIX}{PROJECT}_{DEAD}_abc{runner_pid}{maya_pid}"
     root.mkdir()
     state = {
@@ -33,9 +33,8 @@ def make_dir(temp: Path, runner_pid: object, maya_pid: object, *, age: float = 0
         "url": "http://127.0.0.1:1/mcp",
         "started": NOW,
         "ttl": 60,
+        "maya_created": created,
     }
-    if created:  # without it, state.json is one from before the creation time
-        state["maya_created"] = created
     (root / session.STATE_FILE).write_text(json.dumps(state), encoding="utf-8")
     os.utime(root, (NOW - age, NOW - age))
     return root
@@ -93,7 +92,7 @@ def test_sessions_lists_live_mayas_oldest_first(tmp_path: Path) -> None:
     state["started"] = NOW + 1
     (second / session.STATE_FILE).write_text(json.dumps(state), encoding="utf-8")
     assert [found.root for found in session.sessions(tmp_path, maya=maya)] == [first, second]
-    assert session.read_state(first).maya_created == 0
+    assert session.read_state(first).maya_created == 1
 
 
 def test_a_maya_pid_counts_only_with_its_creation_time(tmp_path: Path) -> None:
@@ -113,6 +112,15 @@ def test_state_round_trip(tmp_path: Path) -> None:
     state = State(PROJECT, "C:/x", 1, 2, "http://127.0.0.1:1/mcp", NOW, 60, 134_000_000_000_000_000)
     session.write_state(tmp_path, state)
     assert session.read_state(tmp_path) == state
+
+
+@pytest.mark.parametrize("key", ["ttl", "maya_created"])
+def test_state_without_a_key_is_none(tmp_path: Path, key: str) -> None:
+    session.write_state(tmp_path, State(PROJECT, "C:/x", 1, 2, "http://127.0.0.1:1/mcp", NOW, 60, 7))
+    data = json.loads((tmp_path / session.STATE_FILE).read_text(encoding="utf-8"))
+    del data[key]
+    (tmp_path / session.STATE_FILE).write_text(json.dumps(data), encoding="utf-8")
+    assert session.read_state(tmp_path) is None
 
 
 PARAMS = SessionParams(

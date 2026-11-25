@@ -216,8 +216,6 @@ def kill_maya(pid: int, recorded: int) -> bool:
             ours = is_our_maya(win32.image_name(handle), win32.creation_time(handle), recorded)
         except OSError:  # exited, though someone still holds a handle: no image name (WinError 31)
             return bool(win32.kernel32.WaitForSingleObject(handle, 0) == 0)
-        if not recorded:  # a state.json from before the creation time: cannot tell
-            return False
         if not ours:
             return True  # the pid names another process now
         win32.kernel32.TerminateProcess(handle, 1)  # unchecked: a process already exiting refuses
@@ -227,16 +225,14 @@ def kill_maya(pid: int, recorded: int) -> bool:
 
 
 def maya_alive(pid: int, recorded: int) -> bool:
-    """Our Maya `pid` still runs. Windows reuses pids: with a recorded creation time, a pid that
-    names another process now is not our Maya; without one (an old state.json), the pid decides."""
+    """Our Maya `pid` still runs. Windows reuses pids: a pid that names another process now is
+    not our Maya."""
     handle = win32.kernel32.OpenProcess(win32.PROCESS_QUERY_LIMITED_INFORMATION | win32.SYNCHRONIZE, False, pid)
     if not handle:
         return False
     try:
         if win32.kernel32.WaitForSingleObject(handle, 0) != win32.WAIT_TIMEOUT:
             return False
-        if not recorded:
-            return True
         try:
             return is_our_maya(win32.image_name(handle), win32.creation_time(handle), recorded)
         except OSError:
