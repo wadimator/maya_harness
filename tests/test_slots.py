@@ -3,7 +3,6 @@
 import json
 import os
 import subprocess
-import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -171,24 +170,6 @@ def test_holders_are_the_taken_slots_only(own_slots: Path, monkeypatch: pytest.M
     assert slots.holders() == [slots.Holder(2)]
     second.release()
     assert slots.holders() == []
-
-
-def test_in_call_is_the_start_of_a_call_whose_process_lives(tmp_path: Path) -> None:
-    assert slots.in_call(tmp_path) is None
-    slots.begin_call(tmp_path)
-    since = slots.in_call(tmp_path)
-    assert since is not None and abs(since - time.time()) < 60
-    slots.end_call(tmp_path)
-    assert slots.in_call(tmp_path) is None
-    slots.end_call(tmp_path)  # twice: the file is gone already
-
-
-def test_in_call_of_a_dead_process_is_none(tmp_path: Path) -> None:
-    """An exec killed in its wait leaves the file behind: Maya is not busy forever."""
-    dead = subprocess.Popen([sys.executable, "-c", ""])
-    dead.wait()
-    (tmp_path / "in_call").write_text(json.dumps({"pid": dead.pid, "since": time.time()}), encoding="utf-8")
-    assert slots.in_call(tmp_path) is None
 
 
 def test_a_maya_of_start_in_a_call_is_busy_not_idle(tmp_path: Path) -> None:

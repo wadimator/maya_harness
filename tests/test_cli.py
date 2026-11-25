@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from maya_harness import cli, session, slots, transport
+from maya_harness import call, cli, session, transport
 from maya_harness.session import Record, State
 
 
@@ -99,7 +99,7 @@ def test_exec_touches_last_call_after_a_failed_call(monkeypatch: pytest.MonkeyPa
         raise ConnectionResetError("the call was cut")
 
     monkeypatch.setattr(cli, "select", lambda url: ("http://127.0.0.1:1/mcp", None))
-    monkeypatch.setattr(transport, "connect", lambda url, timeout, expected=None, watch=None: work)
+    monkeypatch.setattr(call, "connect", lambda url, timeout, **_: call.Target(url, work))
     monkeypatch.setattr(transport, "execute", execute)
     assert cli.main(["exec", "-c", "1"]) == cli.FAILED  # the code reached Maya
     assert last_call.stat().st_mtime > 1_000_000_000
@@ -116,7 +116,7 @@ def test_exec_whose_maya_refuses_the_connection_runs_nothing(monkeypatch: pytest
         raise urllib.error.URLError(ConnectionRefusedError(10061, "refused"))
 
     monkeypatch.setattr(cli, "select", lambda url: ("http://127.0.0.1:1/mcp", None))
-    monkeypatch.setattr(transport, "connect", lambda url, timeout, expected=None, watch=None: tmp_path)
+    monkeypatch.setattr(call, "connect", lambda url, timeout, **_: call.Target(url, tmp_path))
     monkeypatch.setattr(transport, "read_in_background", refused)
     assert cli.main(["exec", "-c", "1"]) == cli.NOT_RUN
 
@@ -130,7 +130,7 @@ def test_exec_with_an_unreadable_reply_exits_1_and_at_connect_2(
     monkeypatch.setattr(cli, "select", lambda url: ("http://127.0.0.1:1/mcp", None))
     monkeypatch.setattr(transport, "read_in_background", lambda request, timeout, watch=None: "<html></html>")
     assert cli.main(["exec", "-c", "1"]) == cli.NOT_RUN
-    monkeypatch.setattr(transport, "connect", lambda url, timeout, expected=None, watch=None: tmp_path)
+    monkeypatch.setattr(call, "connect", lambda url, timeout, **_: call.Target(url, tmp_path))
     assert cli.main(["exec", "-c", "1"]) == cli.FAILED
 
 
@@ -150,7 +150,7 @@ def test_stop_kills_at_once_and_keeps_the_directory_of_a_maya_still_running(
 
     stuck, killed = target(10), target(20)
     monkeypatch.setattr(session, "sessions", lambda temp: [stuck, killed])
-    monkeypatch.setattr(transport, "connect", no_call)
+    monkeypatch.setattr(call, "connect", no_call)
     monkeypatch.setattr(transport, "execute", no_call)
     monkeypatch.setattr(process, "window_titles", lambda pid: ["Maya-2025"])
     monkeypatch.setattr(process, "kill_maya", lambda pid, created: pid == killed.state.maya_pid)
@@ -181,7 +181,7 @@ def test_exec_reload_is_a_call_of_its_own(monkeypatch: pytest.MonkeyPatch, tmp_p
     code = "from __future__ import annotations\n1"
     monkeypatch.setattr(cli, "select", lambda url: ("http://127.0.0.1:1/mcp", None))
     monkeypatch.setattr(config, "load", lambda start: config.Config("p", tmp_path, reload=("pkg",)))
-    monkeypatch.setattr(transport, "connect", lambda url, timeout, expected=None, watch=None: tmp_path)
+    monkeypatch.setattr(call, "connect", lambda url, timeout, **_: call.Target(url, tmp_path))
     monkeypatch.setattr(transport, "execute", execute)
     assert cli.main(["exec", "--reload", "-c", code]) == cli.OK
     assert sent == [cli.reload_code(("pkg",)), code]
@@ -210,7 +210,7 @@ def test_exec_prints_the_error_only_without_a_traceback(
 ) -> None:
     """dcc-mcp names every failure of code `RuntimeError`; its real type ends the traceback."""
     monkeypatch.setattr(cli, "select", lambda url: ("http://127.0.0.1:1/mcp", None))
-    monkeypatch.setattr(transport, "connect", lambda url, timeout, expected=None, watch=None: tmp_path)
+    monkeypatch.setattr(call, "connect", lambda url, timeout, **_: call.Target(url, tmp_path))
     monkeypatch.setattr(transport, "execute", lambda url, code, timeout, watch=None: result)
     assert cli.main(["exec", "-c", "x"]) == cli.FAILED
     assert capsys.readouterr().err == printed
@@ -270,17 +270,17 @@ def test_exec_on_a_modal_dialog_exits_1_with_its_title(
     """The code went to Maya: it runs on once the dialog is answered."""
 
     def execute(url: str, code: str, timeout: float, watch: transport.Watch | None = None) -> transport.Result:
-        assert watch is not None and slots.in_call(tmp_path / "work") is not None  # status: busy
+        assert watch is not None and call.activity(tmp_path / "work", 0)[0] is not None  # status: busy
         watch()
         return transport.Result(True)
 
     on_a_dialog(monkeypatch, tmp_path)
-    monkeypatch.setattr(transport, "connect", lambda url, timeout, expected=None, watch=None: tmp_path / "work")
+    monkeypatch.setattr(call, "connect", lambda url, timeout, **_: call.Target(url, tmp_path / "work"))
     monkeypatch.setattr(transport, "execute", execute)
     assert cli.main(["exec", "-c", "1"]) == cli.FAILED
     err = capsys.readouterr().err
     assert DIALOG in err and "maya-harness stop http://127.0.0.1:1/mcp" in err
-    assert slots.in_call(tmp_path / "work") is None
+    assert call.activity(tmp_path / "work", 0)[0] is None
 
 
 def test_exec_into_a_maya_already_on_a_dialog_exits_2(
@@ -288,13 +288,13 @@ def test_exec_into_a_maya_already_on_a_dialog_exits_2(
 ) -> None:
     """The marker of connect waits on Maya's main thread too: only the watch ends that wait."""
 
-    def connect(url: str, timeout: float, expected: Path | None = None, watch: transport.Watch | None = None) -> Path:
+    def connect(url: str, timeout: float, *, watch: transport.Watch | None = None, **_: object) -> call.Target:
         assert watch is not None
         watch()
-        return tmp_path / "work"
+        return call.Target(url, tmp_path / "work")
 
     on_a_dialog(monkeypatch, tmp_path)
-    monkeypatch.setattr(transport, "connect", connect)
+    monkeypatch.setattr(call, "connect", connect)
     assert cli.main(["exec", "-c", "1"]) == cli.NOT_RUN
     assert DIALOG in capsys.readouterr().err
 
@@ -328,9 +328,9 @@ def test_exec_waits_its_timeout_and_shows_signs_of_life(
     now = [0.0]
     timeouts: list[float] = []
 
-    def connect(url: str, timeout: float, expected: Path | None = None, watch: transport.Watch | None = None) -> Path:
+    def connect(url: str, timeout: float, **_: object) -> call.Target:
         timeouts.append(timeout)
-        return tmp_path / "work"
+        return call.Target(url, tmp_path / "work")
 
     def execute(url: str, code: str, timeout: float, watch: transport.Watch | None = None) -> transport.Result:
         timeouts.append(timeout)
@@ -346,7 +346,7 @@ def test_exec_waits_its_timeout_and_shows_signs_of_life(
     monkeypatch.setattr(cli.time, "monotonic", lambda: now[0])
     monkeypatch.setattr(process, "modal_dialog", lambda pid, desktop=None: [])
     monkeypatch.setattr(process, "window_titles", lambda pid: ["untitled - Autodesk MAYA"])
-    monkeypatch.setattr(transport, "connect", connect)
+    monkeypatch.setattr(call, "connect", connect)
     monkeypatch.setattr(transport, "execute", execute)
     assert cli.main(["exec", "-c", "1+1", "--timeout", "5", "--json"]) == cli.OK
     assert timeouts == [5, 5]

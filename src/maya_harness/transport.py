@@ -39,7 +39,6 @@ BUSY = "maya-busy"
 BUSY_RETRY = 0.5  # seconds between the repeats of a call refused with maya-busy
 STARTUP_TIMEOUT = 180  # seconds for a Maya to start and connect; a cold start takes 12-15
 LOG_DIR = Path(os.environ.get("LOCALAPPDATA", "")) / "dcc-mcp" / "log"
-MARKER_CODE = "import json, os\njson.dumps(os.environ.get('MAYA_HARNESS_WORK', ''))"
 WATCH_EVERY = 2.0  # seconds between the calls of `watch` while a reply is awaited
 
 Watch = Callable[[], None]
@@ -227,11 +226,8 @@ def execute(url: str, code: str, timeout: float, watch: Watch | None = None) -> 
         time.sleep(BUSY_RETRY)
 
 
-def connect(url: str, timeout: float, work: Path | None = None, watch: Watch | None = None) -> Path:
-    """The handshake, then the marker: a session's Maya holds its work directory there, and the
-    Maya a session started must hold its own one — a port another Maya took would run the code
-    there. Returns the work directory of that Maya. The marker goes to Maya's main thread like
-    any code: a Maya on a modal dialog holds it, and only `watch` cuts that wait short."""
+def handshake(url: str, timeout: float, watch: Watch | None = None) -> None:
+    """`initialize`, then `notifications/initialized`: the server takes calls after it."""
     call(
         url,
         "initialize",
@@ -241,12 +237,3 @@ def connect(url: str, timeout: float, work: Path | None = None, watch: Watch | N
         watch,
     )
     call(url, "notifications/initialized", {}, None, timeout, watch)
-    result = execute(url, MARKER_CODE, timeout, watch)
-    if not result.success:
-        raise TransportError(f"{url} did not check its marker: {result.error or result.raw}")
-    marker = result.value()
-    if not marker:
-        raise TransportError(f"{url} is not a Maya started by maya_harness: nothing is run there.")
-    if work is not None and marker != str(work):
-        raise TransportError(f"{url} is another Maya of maya_harness: its marker is {marker}, not {work}.")
-    return Path(marker)

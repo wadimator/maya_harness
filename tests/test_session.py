@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from maya_harness import inmaya, process, session, slots, win32
+from maya_harness import inmaya, session, slots, win32
 from maya_harness.session import SessionParams, State
 
 PROJECT = "Retarget_Master"  # `_` in the name: the directory name cannot be split into a pid
@@ -274,6 +274,7 @@ class FakeMaya:
         self.pid = 4242
         self.created = 7
         self.handle = 0
+        self.desktop = None
         self.closed = False
         self.released = False
 
@@ -340,7 +341,7 @@ def test_with_closes_the_maya_and_removes_the_directory(
             raise KeyboardInterrupt
 
     monkeypatch.setattr(session.transport, "wait_for_server", wait_for_server)
-    monkeypatch.setattr(session.transport, "connect", lambda url, timeout, work: work)
+    monkeypatch.setattr(session.call, "connect", lambda *_, **__: None)
     with pytest.raises(raised), session.start(STARTED, temp=installed) as started:
         started.wait(1)
         raise raised
@@ -355,6 +356,25 @@ def test_wait_turns_a_timeout_into_start_error(installed: Path, monkeypatch: pyt
     monkeypatch.setattr(session.transport, "wait_for_server", wait_for_server)
     with session.start(STARTED, temp=installed) as started, pytest.raises(session.StartError, match="Maya 4242"):
         started.wait(1)
+
+
+def test_execute_is_a_marked_call(installed: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`last_call` for the idle timer, `in_call` for `status` while the call runs, a watch for dialogs."""
+    seen: list[object] = []
+
+    def execute(url: str, code: str, timeout: float, watch: object = None) -> session.transport.Result:
+        seen.extend([session.call.activity(started.work, 0)[0], watch])
+        return session.transport.Result(True)
+
+    monkeypatch.setattr(session.transport, "execute", execute)
+    with session.start(STARTED, temp=installed) as started:
+        last_call = started.work / inmaya.LAST_CALL
+        last_call.unlink(missing_ok=True)
+        assert started.execute("1", 1).success
+        assert last_call.is_file()
+        assert session.call.activity(started.work, 0)[0] is None
+    busy, watch = seen
+    assert busy is not None and callable(watch)
 
 
 def test_release_keeps_the_maya_and_the_directory(installed: Path) -> None:
@@ -374,16 +394,6 @@ def test_record_writes_state(installed: Path, record: bool) -> None:
             assert state == expected
         else:
             assert not (started.root / session.STATE_FILE).exists()
-
-
-def test_execute_touches_last_call(installed: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(session.transport, "execute", lambda url, code, timeout: session.transport.Result(True))
-    with session.start(STARTED, temp=installed) as started:
-        last_call = started.work / "last_call"
-        last_call.touch()
-        os.utime(last_call, (NOW, NOW))
-        assert started.execute("1", 1).success
-        assert last_call.stat().st_mtime > NOW
 
 
 def slot_free() -> bool:
@@ -442,15 +452,3 @@ def test_start_names_the_holder_of_its_slot(installed: Path) -> None:
         holder = json.loads((slots.DIR / "slot-1.holder").read_text(encoding="utf-8"))
     assert holder["pid"] == 4242 and holder["created"] == 7 and holder["command"] == "start"
     assert (holder["project"], holder["url"], holder["work"]) == (PROJECT, started.url, str(started.work))
-
-
-def test_watcher_cuts_a_call_short_only_on_a_modal_dialog(monkeypatch: pytest.MonkeyPatch) -> None:
-    dialog: list[str] = []
-    monkeypatch.setattr(process, "modal_dialog", lambda pid, desktop=None: dialog)
-    watch = session.watcher(10, "http://127.0.0.1:1/mcp")
-    watch()
-    dialog.append("Untrusted Plugin Loading - Security Warning")
-    with pytest.raises(session.transport.CallAborted) as raised:
-        watch()
-    assert "Maya 10 shows a modal dialog: ['Untrusted Plugin Loading - Security Warning']" in str(raised.value)
-    assert "maya-harness stop http://127.0.0.1:1/mcp" in str(raised.value)

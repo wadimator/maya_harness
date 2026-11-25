@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from maya_harness import cli, config, inmaya, session, slots, win32
+from maya_harness import call, cli, config, inmaya, session, slots, win32
 from maya_harness import run as scenario_run
 from maya_harness.run import Run
 
@@ -239,7 +239,7 @@ class FakeSession:
         self.closed = False
         self.any_closed = closed
 
-    def watch(self) -> None:
+    def execute(self, code: str, timeout: float) -> None:
         pass
 
     def wait(self, timeout: float) -> None:
@@ -282,8 +282,8 @@ def test_a_maya_with_nothing_left_to_run_leaves_before_the_others_end(monkeypatc
     pool, started, out = fake_pool(monkeypatch, runs=2, count=2)
     calls: list[bool] = []
 
-    def run_scenario(url: str, code: str, watch: object = None) -> tuple[list[str], str]:
-        assert watch is not None  # a Maya of the pool on a dialog is cut short too
+    def run_scenario(execute: object, code: str) -> tuple[list[str], str]:
+        assert getattr(execute, "__self__", None) in started  # the call of the session: marked and watched
         with pool.lock:
             first = not calls
             calls.append(True)
@@ -313,7 +313,7 @@ def test_a_maya_started_when_the_queue_is_empty_is_closed_without_a_wait(monkeyp
 
     pool, started, _ = fake_pool(monkeypatch, runs=1, count=2, start=start)
 
-    def run_scenario(url: str, code: str, watch: object = None) -> tuple[list[str], str]:
+    def run_scenario(execute: object, code: str) -> tuple[list[str], str]:
         taken.set()
         return [], ""
 
@@ -336,10 +336,9 @@ def test_a_maya_started_after_a_stop_is_closed_without_a_wait(monkeypatch: pytes
 
 @pytest.mark.parametrize("output", ['{"x": 1}', "null", '{"failures": "load"}', '{"failures": [1]}'])
 def test_a_report_without_a_list_of_failures_is_a_raised_scenario(monkeypatch: pytest.MonkeyPatch, output: str) -> None:
-    monkeypatch.setattr(
-        scenario_run.transport, "execute", lambda *_: scenario_run.transport.Result(True, "", output=output)
+    failures, text = scenario_run.run_scenario(
+        lambda code, timeout: scenario_run.transport.Result(True, "", output=output), ""
     )
-    failures, text = scenario_run.run_scenario("http://x", "")
     assert failures is None
     assert "no report with a list of failures" in text
 
@@ -355,7 +354,7 @@ def test_run_at_url_fails_the_run_maya_did_not_answer(
         raise scenario_run.transport.TransportError("Maya at x stayed maya-busy")
 
     monkeypatch.setattr(scenario_run.session, "sessions", lambda temp: [])
-    monkeypatch.setattr(scenario_run.transport, "connect", lambda *_: tmp_path)
+    monkeypatch.setattr(call, "connect", lambda url, timeout, **_: call.Target(url, tmp_path))
     monkeypatch.setattr(scenario_run.transport, "execute", execute)
     assert cli.main(["run", "--url", "http://x", "all"]) == cli.FAILED
     out = capsys.readouterr().out
@@ -373,7 +372,6 @@ def test_load_runs_refuses_a_run_that_is_not_a_table(tmp_path: Path) -> None:
 def test_run_json_with_every_slot_taken_keeps_stdout_one_json_line(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], project: Path, installed: None
 ) -> None:
-    from maya_harness import slots
 
     monkeypatch.setenv(slots.VARIABLE, "1")
     now = [0.0]
@@ -403,7 +401,6 @@ def test_run_ends_once_no_run_is_left_though_a_maya_still_waits_for_a_slot(
 ) -> None:
     """Two slots, one held by another agent; `--jobs 2`: maya1 takes the other slot and both runs,
     maya2 waits. The slot maya1 frees goes to another harness first: maya2 must give up, not wait."""
-    from maya_harness import slots
 
     monkeypatch.setenv(slots.VARIABLE, "2")
     monkeypatch.setattr(win32, "give", GIVE)  # stubs are real processes: they hold the slot
@@ -440,7 +437,7 @@ def test_run_ends_once_no_run_is_left_though_a_maya_still_waits_for_a_slot(
 
     monkeypatch.setattr(session.process, "MayaProcess", Maya)
     monkeypatch.setattr(session.transport, "wait_for_server", lambda *_: None)
-    monkeypatch.setattr(session.transport, "connect", lambda *_: None)
+    monkeypatch.setattr(session.call, "connect", lambda *_, **__: None)
     monkeypatch.setattr(session.transport, "server_logs", lambda pid: [])
     monkeypatch.setattr(scenario_run, "run_scenario", lambda *_: ([], ""))
     monkeypatch.setattr(slots, "pause", pause)
@@ -463,7 +460,6 @@ def test_run_ends_once_no_run_is_left_though_a_maya_still_waits_for_a_slot(
 
 def test_a_stopped_pool_stops_waiting_for_a_slot(monkeypatch: pytest.MonkeyPatch) -> None:
     """Ctrl+C in a library runner: a worker that waits for a slot must not wait on."""
-    from maya_harness import slots
 
     monkeypatch.setenv(slots.VARIABLE, "1")
     held = slots.take(0)
@@ -499,18 +495,19 @@ def test_run_at_url_fails_the_run_that_stands_on_a_dialog(
         raise scenario_run.transport.CallAborted("Maya 10 shows a modal dialog: ['Untrusted Plugin']")
 
     def execute(url: str, code: str, timeout: float, watch: Callable[[], None] | None = None) -> object:
-        assert watch is not None and slots.in_call(tmp_path) is not None  # status: busy
+        assert watch is not None and call.activity(tmp_path, 0)[0] is not None  # status: busy
         watch()
         raise AssertionError("the watch did not cut the call short")
 
+    monkeypatch.setattr(call, "watcher", lambda pid, url, desktop=None: watch)
     monkeypatch.setattr(scenario_run.transport, "execute", execute)
     out = io.StringIO()
     runs = [Run("check_fps", {}, ""), Run("check_fps", {"x": "1"}, "")]
-    outcomes = scenario_run.run_at_url("http://x", tmp_path, runs, ["", ""], out, watch)
+    outcomes = scenario_run.run_at_url(call.Target("http://x", tmp_path, 10), runs, ["", ""], out)
     assert not outcomes[0].ok and "modal dialog: ['Untrusted Plugin']" in outcomes[0].text
     assert 1 not in outcomes
     assert "not run" in out.getvalue().splitlines()[-1]
-    assert slots.in_call(tmp_path) is None
+    assert call.activity(tmp_path, 0)[0] is None
 
 
 def test_run_at_url_watches_the_maya_of_the_session_at_that_address(
@@ -527,8 +524,8 @@ def test_run_at_url_watches_the_maya_of_the_session_at_that_address(
         return scenario_run.transport.Result(True, "", output='{"failures": []}')
 
     monkeypatch.setattr(scenario_run.session, "sessions", lambda temp: [target])
-    monkeypatch.setattr(scenario_run.session, "watcher", lambda pid, url, desktop=None: watch)
-    monkeypatch.setattr(scenario_run.transport, "connect", lambda *_: tmp_path)
+    monkeypatch.setattr(call, "watcher", lambda pid, url, desktop=None: watch)
+    monkeypatch.setattr(call, "connect", lambda url, timeout, pid=None, **_: call.Target(url, tmp_path, pid))
     monkeypatch.setattr(scenario_run.transport, "execute", execute)
     assert cli.main(["run", "--url", "http://x", "check_fps"]) == cli.OK
     assert watched == [watch]

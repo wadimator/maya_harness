@@ -22,7 +22,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from . import config, process, session, slots, transport
+from . import call, config, process, session, slots, transport
 from . import run as scenario_run
 from .session import Record
 
@@ -212,29 +212,23 @@ def heartbeat(pid: int, watch: transport.Watch) -> transport.Watch:
 
 def run(args: argparse.Namespace) -> int:
     code = args.code if args.code is not None else args.file.read_text(encoding="utf-8")
-    url, target = select(args.url)
+    url, record = select(args.url)
     packages = config.load(Path.cwd()).reload if args.reload else ()
     # Only a Maya of a session: the pid of a Maya at a foreign address is unknown.
-    watch = heartbeat(target.state.maya_pid, session.watcher(target.state.maya_pid, url)) if target else None
+    pid = record.state.maya_pid if record else None
+    watch = heartbeat(pid, call.watcher(pid, url)) if pid is not None else None
     # A connect cut short on a dialog is a TransportError out of `main`: the code was not sent.
-    work = transport.connect(url, args.timeout, target.work if target else None, watch)
-    session.touch(work)
-    slots.begin_call(work)
+    target = call.connect(url, args.timeout, work=record.work if record else None, pid=pid, watch=watch)
     try:
         # A call of its own, not a prefix of the code: `from __future__` must open the code, and
         # the line numbers of its traceback must be the file's.
-        result = (
-            transport.execute(url, reload_code(packages), args.timeout, watch) if packages else transport.Result(True)
-        )
+        result = target.execute(reload_code(packages), args.timeout, watch) if packages else transport.Result(True)
         if result.success:
-            result = transport.execute(url, code, args.timeout, watch)
+            result = target.execute(code, args.timeout, watch)
     except OSError as error:  # a timeout, a reset: the code reached Maya and may have run
         result = transport.Result(False, type(error).__name__, stderr=f"no reply from {url}: {error}")
     except transport.CallAborted as error:  # the code reached Maya and runs on after the dialog
         result = transport.Result(False, type(error).__name__, stderr=str(error))
-    finally:
-        slots.end_call(work)
-        session.touch(work)
     if args.json:
         fields = ("success", "error", "stdout", "stderr", "output")
         print(json.dumps({name: getattr(result, name) for name in fields} | {"url": url}, ensure_ascii=False))
@@ -264,10 +258,9 @@ def run_scenarios(args: argparse.Namespace) -> int:
     codes = [scenario_run.code_of(item, project.scenarios.dir, project.reload) for item in runs]
     out = sys.stderr if args.json else sys.stdout
     if args.url:
-        _, target = select(args.url)
-        watch = session.watcher(target.state.maya_pid, args.url) if target else None
-        work = transport.connect(args.url, CALL_TIMEOUT, None, watch)
-        outcomes = scenario_run.run_at_url(args.url, work, runs, codes, out, watch)
+        _, record = select(args.url)
+        target = call.connect(args.url, CALL_TIMEOUT, pid=record.state.maya_pid if record else None)
+        outcomes = scenario_run.run_at_url(target, runs, codes, out)
     else:
         count = 1 if args.visible else max(1, min(args.jobs, len(runs)))
         pool = scenario_run.run_in_pool(project, runs, codes, count, args.visible, temp_dir(), out, args.slot_wait)
@@ -316,12 +309,7 @@ def describe(item: Record, now: float) -> dict[str, Any]:
     """A session for `status` and `stop`: `busy` — the seconds of the running call, None when none
     runs; `idle` — since the last call; `windows` — what Maya shows, a dialog on the hidden desktop
     too."""
-    last_call = item.work / "last_call"
-    try:
-        idle_since = last_call.stat().st_mtime
-    except OSError:
-        idle_since = item.state.started
-    since = slots.in_call(item.work)
+    since, idle_since = call.activity(item.work, item.state.started)
     return {
         "project": item.state.project,
         "project_root": item.state.project_root,

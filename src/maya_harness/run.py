@@ -38,10 +38,11 @@ import sys
 import threading
 import time
 import tomllib
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NamedTuple, TextIO
 
-from . import config, inmaya, session, slots, transport
+from . import call, config, inmaya, session, transport
 
 PREFIX = inmaya.SCENARIO_PREFIX
 JOBS = 3
@@ -132,11 +133,11 @@ def code_of(run: Run, directory: Path, reload: tuple[str, ...]) -> str:
     return f"from maya_harness import inmaya as _maya_harness_inmaya\n_maya_harness_inmaya.run_scenario({arguments})\n"
 
 
-def run_scenario(url: str, code: str, watch: transport.Watch | None = None) -> tuple[list[str] | None, str]:
+def run_scenario(execute: Callable[[str, float], transport.Result], code: str) -> tuple[list[str] | None, str]:
     """The scenario's failures, None when it raised or returned no report with a list of failures, and its
     output: the caller prints it in one piece, and the output of runs in other Mayas does not get between its
-    lines. `watch` cuts a call that stands on a modal dialog short, with `CallAborted`."""
-    result = transport.execute(url, code, TIMEOUT, watch)
+    lines. `execute` is the call of a Maya: one that stands on a modal dialog ends in `CallAborted`."""
+    result = execute(code, TIMEOUT)
     output = [text.rstrip() for text in (result.stdout, result.stderr) if text]
     if not result.success:
         output.append(result.error or json.dumps(result.raw, ensure_ascii=False)[-6000:])
@@ -207,28 +208,21 @@ def summary(runs: list[Run], outcomes: dict[int, Outcome]) -> dict[str, Any]:
     return {"success": passed(runs, outcomes), "runs": rows}
 
 
-def run_at_url(
-    url: str, work: Path, runs: list[Run], codes: list[str], out: TextIO, watch: transport.Watch | None = None
-) -> dict[int, Outcome]:
-    """The runs one after another in the Maya at `url`, a session `start` left running; the summary is printed
+def run_at_url(target: call.Target, runs: list[Run], codes: list[str], out: TextIO) -> dict[int, Outcome]:
+    """The runs one after another in the Maya `target`, a session `start` left running; the summary is printed
     even when a run is cut short. A call Maya does not answer fails its run, and the runs after it are «not run»."""
     outcomes: dict[int, Outcome] = {}
     try:
         for index, (run, code) in enumerate(zip(runs, codes, strict=True)):
             print(f"=== {label_of(run)}", file=out, flush=True)
             start = time.monotonic()
-            session.touch(work)
-            slots.begin_call(work)
             try:
-                failures, output = run_scenario(url, code, watch)
+                failures, output = run_scenario(target.execute, code)
             # Maya is gone, busy or on a dialog: the runs after it wait
             except (OSError, transport.TransportError) as error:
-                text = f"FAIL: no reply from {url} — {type(error).__name__}: {error}"
+                text = f"FAIL: no reply from {target.url} — {type(error).__name__}: {error}"
                 outcomes[index] = Outcome(time.monotonic() - start, False, text, 0)
                 break
-            finally:
-                slots.end_call(work)
-                session.touch(work)
             print(output, file=out, flush=True)
             outcomes[index] = Outcome(time.monotonic() - start, *verdict(run.expected, failures), 0)
     finally:
@@ -337,7 +331,7 @@ class Pool:
             self.say(f"{name}: {label_of(run)}", self.out)
             start = time.monotonic()
             try:
-                failures, output = run_scenario(started.url, self.codes[index], started.watch)
+                failures, output = run_scenario(started.execute, self.codes[index])
             # Maya crashed, the scenario timed out, or Maya stands on a dialog nobody on its hidden desktop
             # answers: the `finally` of `work` kills it
             except (OSError, transport.TransportError) as error:
