@@ -1,10 +1,11 @@
 import json
+import os
 import time
 from pathlib import Path
 
 import pytest
 
-from maya_harness import cli, session, transport
+from maya_harness import cli, session, slots, transport
 from maya_harness.session import Record, State
 
 
@@ -265,7 +266,7 @@ def test_exec_on_a_modal_dialog_exits_1_with_its_title(
     """The code went to Maya: it runs on once the dialog is answered."""
 
     def execute(url: str, code: str, timeout: float, watch: transport.Watch | None = None) -> transport.Result:
-        assert watch is not None
+        assert watch is not None and slots.in_call(tmp_path / "work") is not None  # status: busy
         watch()
         return transport.Result(True)
 
@@ -275,6 +276,7 @@ def test_exec_on_a_modal_dialog_exits_1_with_its_title(
     assert cli.main(["exec", "-c", "1"]) == cli.FAILED
     err = capsys.readouterr().err
     assert DIALOG in err and "maya-harness stop http://127.0.0.1:1/mcp" in err
+    assert slots.in_call(tmp_path / "work") is None
 
 
 def test_exec_into_a_maya_already_on_a_dialog_exits_2(
@@ -291,3 +293,23 @@ def test_exec_into_a_maya_already_on_a_dialog_exits_2(
     monkeypatch.setattr(transport, "connect", connect)
     assert cli.main(["exec", "-c", "1"]) == cli.NOT_RUN
     assert DIALOG in capsys.readouterr().err
+
+
+def test_status_tells_a_running_call_from_idleness_and_shows_the_windows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A call that hangs for minutes is not idleness: `last_call` is touched only around it."""
+    from maya_harness import process
+
+    item = Record(tmp_path, State("p", str(tmp_path), 1, 10, "http://127.0.0.1:1/mcp", time.time() - 600))
+    item.work.mkdir()
+    monkeypatch.setattr(session, "sessions", lambda temp: [item])
+    monkeypatch.setattr(process, "window_titles", lambda pid: [DIALOG, "untitled - Autodesk MAYA"])
+    assert cli.main(["status"]) == cli.OK
+    assert f"idle 10 min, windows [{DIALOG}, untitled - Autodesk MAYA]" in capsys.readouterr().out
+    (item.work / "in_call").write_text(json.dumps({"pid": os.getpid(), "since": time.time() - 540}), encoding="utf-8")
+    assert cli.main(["status"]) == cli.OK
+    assert "busy 9 min, windows [" in capsys.readouterr().out
+    assert cli.main(["status", "--json"]) == cli.OK
+    row = json.loads(capsys.readouterr().out)[0]
+    assert 539 <= row["busy"] <= 541 and row["windows"] == [DIALOG, "untitled - Autodesk MAYA"]

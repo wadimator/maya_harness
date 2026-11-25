@@ -41,7 +41,7 @@ import tomllib
 from pathlib import Path
 from typing import Any, NamedTuple, TextIO
 
-from . import config, session, transport
+from . import config, session, slots, transport
 
 PREFIX = "check_"  # a scenario's module name; the modules with it are dropped before each run
 JOBS = 3
@@ -230,6 +230,7 @@ def run_at_url(
             print(f"=== {label_of(run)}", file=out, flush=True)
             start = time.monotonic()
             session.touch(work)
+            slots.begin_call(work)
             try:
                 failures, output = run_scenario(url, code, watch)
             # Maya is gone, busy or on a dialog: the runs after it wait
@@ -238,6 +239,7 @@ def run_at_url(
                 outcomes[index] = Outcome(time.monotonic() - start, False, text, 0)
                 break
             finally:
+                slots.end_call(work)
                 session.touch(work)
             print(output, file=out, flush=True)
             outcomes[index] = Outcome(time.monotonic() - start, *verdict(run.expected, failures), 0)

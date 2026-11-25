@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from maya_harness import cli, config, session
+from maya_harness import cli, config, session, slots
 from maya_harness import run as scenario_run
 from maya_harness.run import Run
 
@@ -500,7 +500,7 @@ def test_run_at_url_fails_the_run_that_stands_on_a_dialog(
         raise scenario_run.transport.CallAborted("Maya 10 shows a modal dialog: ['Untrusted Plugin']")
 
     def execute(url: str, code: str, timeout: float, watch: Callable[[], None] | None = None) -> object:
-        assert watch is not None
+        assert watch is not None and slots.in_call(tmp_path) is not None  # status: busy
         watch()
         raise AssertionError("the watch did not cut the call short")
 
@@ -511,6 +511,7 @@ def test_run_at_url_fails_the_run_that_stands_on_a_dialog(
     assert not outcomes[0].ok and "modal dialog: ['Untrusted Plugin']" in outcomes[0].text
     assert 1 not in outcomes
     assert "not run" in out.getvalue().splitlines()[-1]
+    assert slots.in_call(tmp_path) is None
 
 
 def test_run_at_url_watches_the_maya_of_the_session_at_that_address(

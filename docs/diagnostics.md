@@ -43,6 +43,8 @@
   * `work\startup.txt` — докуда дошёл `userSetup.py`; трейсбек — если не загрузился плагин;
   * `work\dcc_mcp_bootstrap.jsonl` — этапы загрузки dcc-mcp;
   * `work\last_call` — время последнего `exec`, от него считается простой;
+  * `work\in_call` — идущий вызов: pid ждущего процесса и с какого времени; по нему `status`,
+    `stop` и ожидание слота пишут `busy`;
   * `app\` — `MAYA_APP_DIR` сеанса, `appdata\` — его `APPDATA`.
 
   Каталог Maya, убитой `stop`, `stop` удаляет сразу; если `stop` сказал `still running`,

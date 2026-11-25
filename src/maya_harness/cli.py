@@ -187,6 +187,7 @@ def run(args: argparse.Namespace) -> int:
     # A connect cut short on a dialog is a TransportError out of `main`: the code was not sent.
     work = transport.connect(url, CALL_TIMEOUT, target.work if target else None, watch)
     session.touch(work)
+    slots.begin_call(work)
     try:
         # A call of its own, not a prefix of the code: `from __future__` must open the code, and
         # the line numbers of its traceback must be the file's.
@@ -200,6 +201,7 @@ def run(args: argparse.Namespace) -> int:
     except transport.CallAborted as error:  # the code reached Maya and runs on after the dialog
         result = transport.Result(False, type(error).__name__, stderr=str(error))
     finally:
+        slots.end_call(work)
         session.touch(work)
     if args.json:
         fields = ("success", "error", "stdout", "stderr", "output")
@@ -267,9 +269,8 @@ def stop(args: argparse.Namespace) -> int:
     now = time.time()
     for item in targets:
         pid = item.state.maya_pid
-        titles = ", ".join(process.window_titles(pid))
-        idle = describe(item, now)["idle"] // 60
-        print(f"Maya {pid} {item.state.url} {item.state.project}: idle {idle} min, windows [{titles}]", flush=True)
+        row = describe(item, now)
+        print(f"Maya {pid} {item.state.url} {item.state.project}: {activity(row)}", flush=True)
         if process.kill_maya(pid, item.state.maya_created):
             shutil.rmtree(item.root, ignore_errors=True)
             print(f"Maya {pid}: killed")
@@ -280,11 +281,15 @@ def stop(args: argparse.Namespace) -> int:
 
 
 def describe(item: Record, now: float) -> dict[str, Any]:
+    """A session for `status` and `stop`: `busy` — the seconds of the running call, None when none
+    runs; `idle` — since the last call; `windows` — what Maya shows, a dialog on the hidden desktop
+    too."""
     last_call = item.work / "last_call"
     try:
         idle_since = last_call.stat().st_mtime
     except OSError:
         idle_since = item.state.started
+    since = slots.in_call(item.work)
     return {
         "project": item.state.project,
         "project_root": item.state.project_root,
@@ -292,9 +297,17 @@ def describe(item: Record, now: float) -> dict[str, Any]:
         "url": item.state.url,
         "age": round(now - item.state.started),
         "idle": round(now - idle_since),
+        "busy": None if since is None else round(now - since),
         "ttl": item.state.ttl,
         "dir": str(item.root),
+        "windows": process.window_titles(item.state.maya_pid),
     }
+
+
+def activity(row: dict[str, Any]) -> str:
+    """`busy` while a call runs, else `idle`, and Maya's windows."""
+    doing = f"idle {row['idle'] // 60} min" if row["busy"] is None else f"busy {row['busy'] // 60} min"
+    return f"{doing}, windows [{', '.join(row['windows'])}]"
 
 
 def status(args: argparse.Namespace) -> int:
@@ -308,7 +321,7 @@ def status(args: argparse.Namespace) -> int:
     for row in rows:
         print(
             f"{row['project']:<20} pid {row['pid']:<6} {row['url']:<28} "
-            f"age {row['age'] // 60} min, idle {row['idle'] // 60} min, ttl {row['ttl']} min  {row['project_root']}"
+            f"age {row['age'] // 60} min, ttl {row['ttl']} min  {row['project_root']}  {activity(row)}"
         )
     taken = slots.holders()
     print(f"Maya slots: {len(taken)} of {slots.count()} taken")

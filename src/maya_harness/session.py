@@ -29,7 +29,9 @@
   Idle is the age of `work/last_call`, which `exec` touches before and after its call: the timer
   is on Maya's main thread and is silent while a call runs there, so without the touch after
   the call a call longer than the TTL would be followed by a quit at once. Qt runs the timer
-  inside a modal dialog's loop too: a Maya stuck on a dialog still quits.
+  inside a modal dialog's loop too: a Maya stuck on a dialog still quits. `work/in_call` tells
+  `status`, `stop` and a harness waiting for a slot a running call from idleness;
+  the timer still counts from `last_call`.
 * `userSetup.py` turns off the userSetup checksum: otherwise `quit` stops at the modal «Secure
   UserSetup Checksum verification», since `userSetup.py` is new in every session. A
   `userPrefs.mel` written in advance does not do it: Maya's first start in a new settings
