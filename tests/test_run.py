@@ -196,7 +196,7 @@ def test_run_removes_the_session_of_a_maya_that_failed_to_start(
 
     monkeypatch.setattr(session.process, "MayaProcess", fail_to_start)
     assert cli.main(["run", "check_fps"]) == cli.NOT_RUN
-    assert list((tmp_path / "temp").iterdir()) == []
+    assert list((tmp_path / "temp" / registry.SESSIONS).iterdir()) == []
 
 
 def test_the_pool_starts_each_maya_on_a_desktop_of_its_own(
@@ -226,7 +226,7 @@ def test_the_pool_starts_each_maya_on_a_desktop_of_its_own(
     monkeypatch.setattr(session.transport, "server_logs", lambda pid: [])  # the fake pids are not its Mayas
     assert cli.main(["run", "all", "--jobs", "3"]) == cli.NOT_RUN
     assert len(desktops) == 3
-    assert list((tmp_path / "temp").iterdir()) == []
+    assert list((tmp_path / "temp" / registry.SESSIONS).iterdir()) == []
 
 
 class FakeSession:
@@ -513,7 +513,7 @@ def test_run_at_url_fails_the_run_that_stands_on_a_dialog(
 def test_run_at_url_watches_the_maya_of_the_session_at_that_address(
     monkeypatch: pytest.MonkeyPatch, project: Path, tmp_path: Path
 ) -> None:
-    target = registry.Record(tmp_path, registry.State("p", str(tmp_path), 10, 1, "http://x", 0.0, 0, 1))
+    target = registry.Record(tmp_path, registry.State("p", str(tmp_path), 1, "http://x", 0.0, 0, 1))
     watched: list[object] = []
 
     def watch() -> None:

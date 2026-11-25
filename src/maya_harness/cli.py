@@ -159,7 +159,7 @@ def start(args: argparse.Namespace) -> int:
         raise NotRun("--ttl takes 0 or more minutes")
     params = project.params()
     with session.start(
-        params, visible=args.visible, ttl=args.ttl, record=True, temp=temp_dir(), slot_wait=args.slot_wait
+        params, visible=args.visible, ttl=args.ttl, command="start", temp=temp_dir(), slot_wait=args.slot_wait
     ) as running:
         running.wait()
         running.release()

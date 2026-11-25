@@ -34,7 +34,6 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from . import call, process, win32
 
@@ -71,9 +70,19 @@ class Slot:
             win32.kernel32.CloseHandle(self.handle)
             self.handle = None
 
-    def describe(self, holder: dict[str, Any]) -> None:
-        """Writes `slot-<n>.holder`, which shows who holds the slot."""
-        holder_file(self.path).write_text(json.dumps(holder, ensure_ascii=False), encoding="utf-8")
+    def describe(self, holder: Holder) -> None:
+        """Writes `slot-<n>.holder`, which shows who holds the slot. Its keys are those every
+        version reads: the slots are shared by them all."""
+        data = {
+            "pid": holder.pid,
+            "created": holder.created,
+            "project": holder.project,
+            "command": holder.command,
+            "url": holder.url,
+            "work": holder.work,
+            "time": holder.since,
+        }
+        holder_file(self.path).write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
 def count() -> int:

@@ -124,14 +124,16 @@ with session.start(params, visible=False, env=None) as s:
 * `start` ждёт свободный слот машины (`slot_wait` — секунд, `None` — без предела; не
   дождался — `StartError`; `slot_unneeded` — функция без аргументов: вернула `True` во время
   ожидания — `StartError`, слот не берётся), заводит каталог сеанса и поднимает Maya, но
-  сервер не ждёт. До `execute` обязателен `wait(timeout)`.
+  сервер не ждёт. До `execute` обязателен `wait()`: срок по умолчанию —
+  `session.STARTUP_TIMEOUT`, 180 с.
 * Нет `maya.exe`, нет `.mod`, Maya не поднялась за `timeout` — `session.StartError`; в тексте
   pid, окна Maya и её логи.
 * При выходе из `with`, исключении и Ctrl+C Maya убита (job object), каталог сеанса удалён.
   Когда сеансов несколько или сеанс меняется в цикле — без `with`: `start`, `wait`, а
   `close()` — в `finally`.
 * `release()` — только чтобы Maya пережила процесс (так делает `maya-harness start`): ни Maya,
-  ни каталог тогда не удаляются.
+  ни каталог тогда не удаляются, а `state.json` в каталоге даёт `status`, `exec` и `stop` её
+  найти. `command="start"` у `start` — подпись слота для такой Maya, по умолчанию `"run"`.
 * `env` — базовое окружение, по умолчанию `os.environ`: по нему ищутся `maya.exe` и `.mod`, из
   него строится окружение Maya. `MAYA_*`, `PYTHONPATH`, `PYTHONHOME`, `PYTHONSTARTUP` и
   `VIRTUAL_ENV` пакет убирает из него всё равно.

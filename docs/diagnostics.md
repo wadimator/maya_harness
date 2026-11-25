@@ -38,8 +38,10 @@
 
 ## Где смотреть
 
-* **Каталог сеанса** — `%TEMP%\maya_harness_<project>_<pid>_*`, путь — поле `dir` в `status --json`:
-  * `state.json` — проект, pid раннера и Maya, адрес, время старта, TTL;
+* **Каталог сеанса** — `%TEMP%\maya_harness\sessions\maya_harness_<project>_<pid>_*`, путь — поле
+  `dir` в `status --json`:
+  * `state.json` — проект, pid и время создания Maya, адрес, время `release`, TTL; есть только у
+    Maya, которую отпустил `start`;
   * `work\startup.txt` — докуда дошёл `userSetup.py`; трейсбек — если не загрузился плагин;
   * `work\dcc_mcp_bootstrap.jsonl` — этапы загрузки dcc-mcp;
   * `work\last_call` — время последнего `exec`, от него считается простой;

@@ -162,10 +162,8 @@ def test_holders_are_the_taken_slots_only(own_slots: Path, monkeypatch: pytest.M
     """A free slot keeps the .holder of its last Maya; a holder that is not a live Maya is starting."""
     monkeypatch.setenv(slots.VARIABLE, "3")
     first, second = slots.take(0), slots.take(0)
-    second.describe(
-        {"pid": os.getpid(), "created": 1, "project": "p", "command": "run", "url": "u", "work": "w", "time": 0}
-    )
-    first.describe({"pid": 1, "created": 1, "project": "p", "command": "run", "url": "u", "work": "w", "time": 0})
+    second.describe(slots.Holder(2, os.getpid(), 1, "p", "run", "u", "w", 0))
+    first.describe(slots.Holder(1, 1, 1, "p", "run", "u", "w", 0))
     first.release()
     assert slots.holders() == [slots.Holder(2)]
     second.release()

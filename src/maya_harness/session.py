@@ -36,7 +36,8 @@
   server. `start` does not wait: a worker of a pool that finds nothing left to run once its Maya
   has started closes it without waiting for the server. `Session.close` kills Maya and removes
   the directory; `Session.release` leaves both, for a Maya that outlives this process
-  (`maya-harness start`).
+  (`maya-harness start`), and writes `state.json`, by which `status`, `exec` and `stop` find
+  it. `command` of `start` is only what the slot shows: written once, while Maya starts.
 """
 
 from __future__ import annotations
@@ -50,6 +51,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from . import call, inmaya, process, registry, slots, transport
 
@@ -98,6 +100,8 @@ class Session:
     root: Path
     maya: process.MayaProcess
     url: str
+    params: SessionParams
+    ttl: int = 0
     released: bool = False
 
     @property
@@ -156,7 +160,18 @@ class Session:
         shutil.rmtree(self.root, ignore_errors=True)
 
     def release(self) -> None:
-        """Lets the Maya and the directory outlive this process."""
+        """Lets the Maya and the directory outlive this process. Writes `state.json` first: by it
+        `status`, `exec` and `stop` find the session (`registry`)."""
+        state = registry.State(
+            self.params.project,
+            str(self.params.project_root),
+            self.pid,
+            self.url,
+            time.time(),
+            self.ttl,
+            self.maya.created,
+        )
+        registry.write_state(self.root, state)
         self.maya.release()
         self.released = True
 
@@ -212,8 +227,10 @@ def free_port() -> int:
 
 
 def make_session_dir(project: str, temp: Path) -> Path:
+    sessions = temp / registry.SESSIONS
+    sessions.mkdir(parents=True, exist_ok=True)
     registry.remove_stale(temp)
-    return Path(tempfile.mkdtemp(prefix=f"{registry.PREFIX}{project}_{os.getpid()}_", dir=temp))
+    return Path(tempfile.mkdtemp(prefix=f"{registry.PREFIX}{project}_{os.getpid()}_", dir=sessions))
 
 
 def environment(base: Mapping[str, str], root: Path, params: SessionParams, port: int, ttl: int = 0) -> dict[str, str]:
@@ -276,7 +293,7 @@ def start(
     visible: bool = False,
     env: Mapping[str, str] | None = None,
     ttl: int = 0,
-    record: bool = False,
+    command: Literal["start", "run"] = "run",
     temp: Path | None = None,
     slot_wait: float | None = None,
     slot_unneeded: Callable[[], bool] | None = None,
@@ -287,8 +304,8 @@ def start(
 
     `env` is the environment to start from, `os.environ` by default: `maya.exe` and the dcc-mcp
     `.mod` are found by it, and the Maya's environment is made of it (see the module docstring).
-    `record` writes `state.json`, so that `status`, `exec` and `stop` find the session; `ttl` is in idle
-    minutes, 0 for none. `slot_wait` is how many seconds to wait for a free slot, None for no
+    `command` is what the slot shows its Maya started for: `start` for one `release` will leave
+    running. `ttl` is in idle minutes, 0 for none. `slot_wait` is how many seconds to wait for a free slot, None for no
     limit; StartError when none came free. `slot_unneeded`, asked while it waits, ends the wait
     with StartError once it is True."""
     base = os.environ if env is None else env
@@ -314,33 +331,15 @@ def start(
         shutil.rmtree(root, ignore_errors=True)
         slot.release()
         raise
-    started = Session(root, maya, f"http://127.0.0.1:{port}/mcp")
+    started = Session(root, maya, f"http://127.0.0.1:{port}/mcp", params, ttl)
     try:
         slot.give(maya.handle)  # here: on an error, the except below kills Maya
-        holder = {
-            "pid": maya.pid,
-            "created": maya.created,
-            "project": params.project,
-            "command": "start" if record else "run",
-            "url": started.url,
-            "work": str(started.work),
-            "time": time.time(),
-        }
+        holder = slots.Holder(
+            slot.number, maya.pid, maya.created, params.project, command, started.url, str(started.work), time.time()
+        )
         slot.describe(holder)
         for log in transport.server_logs(maya.pid):  # Windows reuses pids: a stale log holds a stale address
             log.unlink(missing_ok=True)
-        if record:
-            state = registry.State(
-                params.project,
-                str(params.project_root),
-                os.getpid(),
-                maya.pid,
-                started.url,
-                time.time(),
-                ttl,
-                maya.created,
-            )
-            registry.write_state(root, state)
     except BaseException:
         started.close()
         slot.release()

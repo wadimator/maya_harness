@@ -201,7 +201,7 @@ STARTED = SessionParams(PROJECT, Path("C:/project"))
 
 
 def session_dirs(temp: Path) -> list[Path]:
-    return list(temp.glob(f"{registry.PREFIX}*"))
+    return list((temp / registry.SESSIONS).glob(f"{registry.PREFIX}*"))
 
 
 @pytest.mark.parametrize("missing", ["maya.exe", "dcc_mcp_maya.mod"])
@@ -309,16 +309,20 @@ def test_release_keeps_the_maya_and_the_directory(installed: Path) -> None:
     assert session_dirs(installed) == [started.root]
 
 
-@pytest.mark.parametrize("record", [True, False])
-def test_record_writes_state(installed: Path, record: bool) -> None:
-    with session.start(STARTED, temp=installed, ttl=5, record=record) as started:
+def test_release_writes_state(installed: Path) -> None:
+    """Only a released Maya outlives its harness: only it has a `state.json` to be found by."""
+    with session.start(STARTED, temp=installed, ttl=5, command="start") as started:
+        assert not (started.root / registry.STATE_FILE).exists()
+        started.release()
         state = registry.read_state(started.root)
-        if record:
-            assert state is not None
-            expected = State(PROJECT, str(STARTED.project_root), os.getpid(), 4242, started.url, state.started, 5, 7)
-            assert state == expected
-        else:
-            assert not (started.root / registry.STATE_FILE).exists()
+        assert state == State(PROJECT, str(STARTED.project_root), 4242, started.url, state.started, 5, 7)
+
+
+def test_a_session_of_run_writes_no_state(installed: Path) -> None:
+    with session.start(STARTED, temp=installed) as started:
+        holder = json.loads((slots.DIR / "slot-1.holder").read_text(encoding="utf-8"))
+        assert holder["command"] == "run"
+    assert not (started.root / registry.STATE_FILE).exists()
 
 
 def slot_free() -> bool:
@@ -373,7 +377,14 @@ def test_start_gives_up_when_no_slot_comes_free(installed: Path, monkeypatch: py
 
 
 def test_start_names_the_holder_of_its_slot(installed: Path) -> None:
-    with session.start(STARTED, temp=installed, record=True) as started:
-        holder = json.loads((slots.DIR / "slot-1.holder").read_text(encoding="utf-8"))
+    """The slots are shared by every version: the keys are the ones they all read. A Maya of `start`
+    shows `start` while it starts, and `release` does not write the holder again."""
+    holder_file = slots.DIR / "slot-1.holder"
+    with session.start(STARTED, temp=installed, command="start") as started:
+        holder = json.loads(holder_file.read_text(encoding="utf-8"))
+        written = holder_file.stat().st_mtime_ns
+        started.release()
+        assert holder_file.stat().st_mtime_ns == written
+    assert sorted(holder) == ["command", "created", "pid", "project", "time", "url", "work"]
     assert holder["pid"] == 4242 and holder["created"] == 7 and holder["command"] == "start"
     assert (holder["project"], holder["url"], holder["work"]) == (PROJECT, started.url, str(started.work))

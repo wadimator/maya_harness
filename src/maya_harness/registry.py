@@ -1,12 +1,17 @@
 """The sessions on disk that outlive their harness: find them, describe them, stop them.
 
-* A session directory is `%TEMP%/maya_harness_<project>_<pid>_*`. `state.json` in it names its
-  project, the harness and Maya pids and the address. `status`, `exec` and the cleanup read it,
-  not the directory name: after the prefix comes the project, and a project name with `_` in it
+* A session directory is `%TEMP%/maya_harness/sessions/maya_harness_<project>_<pid>_*`.
+  `Session.release` writes `state.json` in it: the project, the Maya pid and creation time, the
+  address. Only a released Maya outlives its harness, and only it is to be found: a Maya still
+  starting, or one of a pool, has none. `status`, `exec` and the cleanup read it, not the
+  directory name: after the prefix comes the project, and a project name with `_` in it
   (`Retarget_Master`) cannot be split into a pid.
-* A directory is kept while its harness or its Maya is alive. One without a readable
-  `state.json` is removed only a day after it was made: a fresh one may not have written it yet.
+* A directory is kept while its Maya is alive. One without a readable `state.json` is removed
+  only a day after it was made: its harness may still be running.
 * Windows reuses pids: a Maya is alive only with the creation time `state.json` recorded.
+* The directories are under `SESSIONS`, not right in `%TEMP%`: the versions before kept theirs
+  at `%TEMP%/maya_harness_*`, with a `runner_pid` in `state.json`; they would read the
+  `state.json` of this version as broken and remove the directory of a live Maya a day later.
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ from . import call, process
 
 PREFIX = "maya_harness_"
 STATE_FILE = "state.json"
+SESSIONS = Path("maya_harness") / "sessions"  # under the temp directory
 UNCLAIMED_AGE = 24 * 60 * 60  # seconds a directory without a readable state.json is kept
 
 
@@ -32,7 +38,6 @@ class State:
 
     project: str
     project_root: str
-    runner_pid: int
     maya_pid: int
     url: str
     started: float
@@ -60,7 +65,6 @@ def read_state(root: Path) -> State | None:
         state = State(
             project=str(data["project"]),
             project_root=str(data["project_root"]),
-            runner_pid=data["runner_pid"],
             maya_pid=data["maya_pid"],
             url=str(data["url"]),
             started=float(data["started"]),
@@ -69,8 +73,7 @@ def read_state(root: Path) -> State | None:
         )
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         return None
-    pids = (state.runner_pid, state.maya_pid)
-    if not all(isinstance(pid, int) and not isinstance(pid, bool) for pid in pids):
+    if not isinstance(state.maya_pid, int) or isinstance(state.maya_pid, bool):
         return None
     return state
 
@@ -81,13 +84,12 @@ def write_state(root: Path, state: State) -> None:
 
 def remove_stale(
     temp: Path,
-    alive: Callable[[int], bool] = process.process_alive,
     now: Callable[[], float] = time.time,
     maya: Callable[[int, int], bool] = process.maya_alive,
 ) -> list[Path]:
-    """Removes the session directories nobody holds; returns them."""
+    """Removes the session directories under `temp` nobody holds; returns them."""
     removed = []
-    for root in temp.glob(f"{PREFIX}*"):
+    for root in (temp / SESSIONS).glob(f"{PREFIX}*"):
         if not root.is_dir():
             continue
         state = read_state(root)
@@ -98,7 +100,7 @@ def remove_stale(
                 continue
             if fresh:
                 continue
-        elif alive(state.runner_pid) or maya(state.maya_pid, state.maya_created):
+        elif maya(state.maya_pid, state.maya_created):
             continue
         shutil.rmtree(root, ignore_errors=True)
         removed.append(root)
@@ -106,9 +108,9 @@ def remove_stale(
 
 
 def running(temp: Path, maya: Callable[[int, int], bool] = process.maya_alive) -> list[Record]:
-    """The sessions whose Maya is alive, the latest started last."""
+    """The sessions under `temp` whose Maya is alive, the latest started last."""
     found = []
-    for root in temp.glob(f"{PREFIX}*"):
+    for root in (temp / SESSIONS).glob(f"{PREFIX}*"):
         state = read_state(root) if root.is_dir() else None
         if state is not None and maya(state.maya_pid, state.maya_created):
             found.append(Record(root, state))

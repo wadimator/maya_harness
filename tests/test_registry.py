@@ -14,21 +14,16 @@ DEAD, ALIVE, OTHER_ALIVE = 101, 202, 303
 NOW = 1_000_000_000.0
 
 
-def alive(pid: int) -> bool:
+def maya(pid: int, created: int) -> bool:
     return pid in (ALIVE, OTHER_ALIVE)
 
 
-def maya(pid: int, created: int) -> bool:
-    return alive(pid)
-
-
-def make_dir(temp: Path, runner_pid: object, maya_pid: object, *, age: float = 0.0, created: int = 1) -> Path:
-    root = temp / f"{registry.PREFIX}{PROJECT}_{DEAD}_abc{runner_pid}{maya_pid}"
-    root.mkdir()
+def make_dir(temp: Path, maya_pid: object, *, age: float = 0.0, created: int = 1, name: str = "") -> Path:
+    root = temp / registry.SESSIONS / f"{registry.PREFIX}{PROJECT}_{DEAD}_{name or maya_pid}"
+    root.mkdir(parents=True)
     state = {
         "project": PROJECT,
         "project_root": "C:/x",
-        "runner_pid": runner_pid,
         "maya_pid": maya_pid,
         "url": "http://127.0.0.1:1/mcp",
         "started": NOW,
@@ -41,53 +36,58 @@ def make_dir(temp: Path, runner_pid: object, maya_pid: object, *, age: float = 0
 
 
 def remove(temp: Path) -> list[Path]:
-    return registry.remove_stale(temp, alive=alive, now=lambda: NOW, maya=maya)
+    return registry.remove_stale(temp, now=lambda: NOW, maya=maya)
 
 
-def test_dead_runner_and_dead_maya_is_removed(tmp_path: Path) -> None:
-    root = make_dir(tmp_path, DEAD, DEAD)
+def test_the_directory_of_a_dead_maya_is_removed(tmp_path: Path) -> None:
+    root = make_dir(tmp_path, DEAD)
     assert remove(tmp_path) == [root]
     assert not root.exists()
 
 
-def test_live_runner_keeps_the_directory(tmp_path: Path) -> None:
-    root = make_dir(tmp_path, ALIVE, DEAD)
-    assert remove(tmp_path) == []
-    assert root.exists()
-
-
-def test_live_maya_keeps_the_directory_of_a_dead_runner(tmp_path: Path) -> None:
-    root = make_dir(tmp_path, DEAD, ALIVE)
+def test_a_live_maya_keeps_its_directory(tmp_path: Path) -> None:
+    root = make_dir(tmp_path, ALIVE)
     assert remove(tmp_path) == []
     assert root.exists()
 
 
 def test_garbage_state_is_removed_when_old(tmp_path: Path) -> None:
-    root = make_dir(tmp_path, "x", ALIVE, age=registry.UNCLAIMED_AGE + 1)
+    root = make_dir(tmp_path, "x", age=registry.UNCLAIMED_AGE + 1)
     assert remove(tmp_path) == [root]
 
 
 def test_garbage_state_is_kept_when_fresh(tmp_path: Path) -> None:
-    root = make_dir(tmp_path, "x", ALIVE)
+    root = make_dir(tmp_path, "x")
     assert remove(tmp_path) == []
     assert root.exists()
 
 
 def test_fresh_directory_without_state_is_kept(tmp_path: Path) -> None:
-    root = tmp_path / f"{registry.PREFIX}{PROJECT}_{DEAD}_new"
-    root.mkdir()
+    root = tmp_path / registry.SESSIONS / f"{registry.PREFIX}{PROJECT}_{DEAD}_new"
+    root.mkdir(parents=True)
     os.utime(root, (NOW, NOW))
     assert remove(tmp_path) == []
-    old = tmp_path / f"{registry.PREFIX}{PROJECT}_{DEAD}_old"
+    old = tmp_path / registry.SESSIONS / f"{registry.PREFIX}{PROJECT}_{DEAD}_old"
     old.mkdir()
     os.utime(old, (NOW - registry.UNCLAIMED_AGE - 1,) * 2)
     assert remove(tmp_path) == [old]
 
 
+def test_a_directory_of_an_older_version_is_not_touched(tmp_path: Path) -> None:
+    """`%TEMP%/maya_harness_*` of the versions before: neither listed nor removed."""
+    old = tmp_path / f"{registry.PREFIX}{PROJECT}_{DEAD}_y"
+    old.mkdir()
+    (old / registry.STATE_FILE).write_text(json.dumps({"maya_pid": ALIVE}), encoding="utf-8")
+    os.utime(old, (NOW - registry.UNCLAIMED_AGE - 1,) * 2)
+    assert remove(tmp_path) == []
+    assert registry.running(tmp_path, maya=maya) == []
+    assert old.is_dir()
+
+
 def test_running_lists_live_mayas_oldest_first(tmp_path: Path) -> None:
-    make_dir(tmp_path, DEAD, DEAD)
-    first = make_dir(tmp_path, DEAD, ALIVE)
-    second = make_dir(tmp_path, ALIVE, OTHER_ALIVE)
+    make_dir(tmp_path, DEAD)
+    first = make_dir(tmp_path, ALIVE)
+    second = make_dir(tmp_path, OTHER_ALIVE)
     state = json.loads((second / registry.STATE_FILE).read_text(encoding="utf-8"))
     state["started"] = NOW + 1
     (second / registry.STATE_FILE).write_text(json.dumps(state), encoding="utf-8")
@@ -97,26 +97,26 @@ def test_running_lists_live_mayas_oldest_first(tmp_path: Path) -> None:
 
 def test_a_maya_pid_counts_only_with_its_creation_time(tmp_path: Path) -> None:
     """Windows reuses pids: the recorded creation time goes along with the Maya pid."""
-    root = make_dir(tmp_path, DEAD, ALIVE, created=7)
+    root = make_dir(tmp_path, ALIVE, created=7)
 
     def created_at(time: int) -> Callable[[int, int], bool]:
-        return lambda pid, created: alive(pid) and created == time
+        return lambda pid, created: maya(pid, created) and created == time
 
     assert [found.root for found in registry.running(tmp_path, maya=created_at(7))] == [root]
     assert registry.running(tmp_path, maya=created_at(8)) == []
-    assert registry.remove_stale(tmp_path, alive=alive, now=lambda: NOW, maya=created_at(7)) == []
-    assert registry.remove_stale(tmp_path, alive=alive, now=lambda: NOW, maya=created_at(8)) == [root]
+    assert registry.remove_stale(tmp_path, now=lambda: NOW, maya=created_at(7)) == []
+    assert registry.remove_stale(tmp_path, now=lambda: NOW, maya=created_at(8)) == [root]
 
 
 def test_state_round_trip(tmp_path: Path) -> None:
-    state = State(PROJECT, "C:/x", 1, 2, "http://127.0.0.1:1/mcp", NOW, 60, 134_000_000_000_000_000)
+    state = State(PROJECT, "C:/x", 2, "http://127.0.0.1:1/mcp", NOW, 60, 134_000_000_000_000_000)
     registry.write_state(tmp_path, state)
     assert registry.read_state(tmp_path) == state
 
 
 @pytest.mark.parametrize("key", ["ttl", "maya_created"])
 def test_state_without_a_key_is_none(tmp_path: Path, key: str) -> None:
-    registry.write_state(tmp_path, State(PROJECT, "C:/x", 1, 2, "http://127.0.0.1:1/mcp", NOW, 60, 7))
+    registry.write_state(tmp_path, State(PROJECT, "C:/x", 2, "http://127.0.0.1:1/mcp", NOW, 60, 7))
     data = json.loads((tmp_path / registry.STATE_FILE).read_text(encoding="utf-8"))
     del data[key]
     (tmp_path / registry.STATE_FILE).write_text(json.dumps(data), encoding="utf-8")
@@ -124,7 +124,7 @@ def test_state_without_a_key_is_none(tmp_path: Path, key: str) -> None:
 
 
 def record(root: str, started: float, url: str = "") -> Record:
-    state = State(PROJECT, str(Path(root)), 1, 2, url or f"http://127.0.0.1:{int(started)}/mcp", started, 0, 1)
+    state = State(PROJECT, str(Path(root)), 2, url or f"http://127.0.0.1:{int(started)}/mcp", started, 0, 1)
     return Record(Path("C:/temp") / f"maya_harness_{started}", state)
 
 
@@ -142,7 +142,7 @@ def test_select_takes_the_url_or_the_latest_of_the_project_root(tmp_path: Path) 
 
 def test_stop_removes_the_directory_only_of_a_killed_maya(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     stuck, killed = (
-        Record(tmp_path / name, State(PROJECT, "C:/p", 1, pid, "u", NOW, 0, 1)) for name, pid in (("a", 10), ("b", 20))
+        Record(tmp_path / name, State(PROJECT, "C:/p", pid, "u", NOW, 0, 1)) for name, pid in (("a", 10), ("b", 20))
     )
     for item in (stuck, killed):
         item.root.mkdir()
@@ -152,7 +152,7 @@ def test_stop_removes_the_directory_only_of_a_killed_maya(tmp_path: Path, monkey
 
 
 def test_describe_tells_a_running_call_from_idleness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    item = Record(tmp_path, State(PROJECT, str(tmp_path), 1, 10, "http://127.0.0.1:1/mcp", time.time() - 600, 5, 1))
+    item = Record(tmp_path, State(PROJECT, str(tmp_path), 10, "http://127.0.0.1:1/mcp", time.time() - 600, 5, 1))
     item.work.mkdir()
     monkeypatch.setattr(process, "window_titles", lambda pid: ["untitled - Autodesk MAYA"])
     row = registry.describe(item, time.time())
