@@ -41,27 +41,13 @@ import tomllib
 from pathlib import Path
 from typing import Any, NamedTuple, TextIO
 
-from . import config, session, slots, transport
+from . import config, inmaya, session, slots, transport
 
-PREFIX = "check_"  # a scenario's module name; the modules with it are dropped before each run
+PREFIX = inmaya.SCENARIO_PREFIX
 JOBS = 3
 MAX_JOBS = 4
 TIMEOUT = 900  # seconds per scenario: a run may reopen scenes with heavy rigs
 RUN_KEYS = ("scenario", "control", "expect", "seconds")
-
-# Executed in Maya: fresh project and scenario modules, then the scenario.
-CODE = """
-import json, sys
-_path = {directory!r}
-while _path in sys.path:
-    sys.path.remove(_path)
-sys.path.insert(0, _path)
-for _name in tuple(sys.modules):
-    if _name.split(".")[0] in {reload!r} or _name.startswith({prefix!r}):
-        del sys.modules[_name]
-import {module}
-json.dumps({module}.run(**{params!r}), ensure_ascii=False, default=str)
-"""
 
 
 class Refused(ValueError):
@@ -141,7 +127,9 @@ def refuse_unknown(runs: list[Run], scenarios: config.Scenarios) -> None:
 
 
 def code_of(run: Run, directory: Path, reload: tuple[str, ...]) -> str:
-    return CODE.format(directory=str(directory), reload=reload, prefix=PREFIX, module=run.scenario, params=run.params)
+    """Runs in Maya: `inmaya.run_scenario`, its last expression the report as JSON."""
+    arguments = f"{str(directory)!r}, {run.scenario!r}, {run.params!r}, {reload!r}"
+    return f"from maya_harness import inmaya as _maya_harness_inmaya\n_maya_harness_inmaya.run_scenario({arguments})\n"
 
 
 def run_scenario(url: str, code: str, watch: transport.Watch | None = None) -> tuple[list[str] | None, str]:

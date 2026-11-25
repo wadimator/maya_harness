@@ -13,7 +13,7 @@
 | `config.py` | `[tool.maya_harness]` из `pyproject.toml` проекта |
 | `slots.py` | слоты машины: общий предел числа Maya, ожидание слота и кого ждём |
 | `run.py` | сценарии проверок: таблица прогонов, вердикт контроля, пул Maya команды `run` |
-| `inmaya.py` | библиотека для кода сценария внутри Maya: `Check`, `run_sections`, `no_prompts`, `work_dir` |
+| `inmaya.py` | код внутри Maya: библиотека сценария `Check`, `run_sections`, `no_prompts`, `work_dir`; `userSetup.py`, перезагрузка модулей, прогон сценария |
 | `cli.py` | команды `start`, `stop`, `status`, `exec`, `run`, `doctor` |
 
 ## Процесс Maya
@@ -52,10 +52,17 @@
 * **Маркер.** Maya сеанса отличает `MAYA_HARNESS_WORK` — её рабочий каталог. Раннер выполняет
   код только в Maya с маркером: у Maya художника его нет, а сценарий может открыть новую сцену
   и выбросить его работу.
-* **Копия пакета в `pylib/`.** Сеанс копирует пакет в свой `pylib/` и ставит его последним в
-  `PYTHONPATH` Maya, после `sys_path` проекта: код сценария импортирует `maya_harness.inmaya`.
-  Копия, а не родитель установленного пакета: это `site-packages` `.venv` проекта с pytest,
-  mypy и остальным.
+* **Копия `inmaya` в `pylib/`.** Сеанс копирует `inmaya.py` с `__init__.py` пакета в свой
+  `pylib/maya_harness/` и ставит `pylib/` последним в `PYTHONPATH` Maya, после `sys_path`
+  проекта: `userSetup.py`, раннер и код сценария импортируют `maya_harness.inmaya`, остальное
+  Maya не нужно. Копия, а не родитель установленного пакета: это `site-packages` `.venv` проекта
+  с pytest, mypy и остальным. Maya, поднятая `start` до обновления пакета, держит старый
+  `inmaya`: после обновления — `stop` и `start`.
+* **Код в Maya — модуль `inmaya`, а не строки.** `userSetup.py` зовёт `inmaya.startup`, `exec
+  --reload` — `inmaya.reload`, прогон сценария — `inmaya.run_scenario`: этот код проверяют
+  линтер, mypy и тесты. Плагины проекта и срок простоя `startup` берёт из окружения
+  (`MAYA_HARNESS_PLUGINS`, `MAYA_HARNESS_TTL`). Ошибку `startup` пишет в `work/startup.txt`
+  сам `userSetup.py`: так видна и ошибка импорта `inmaya`.
 * **`state.json`, а не имя каталога.** Каталог `maya_harness_<project>_<pid>_*` держит живой
   раннер или живая Maya из `state.json`. Pid из имени не разобрать: после префикса стоит имя
   проекта, а в нём бывает `_` (`Retarget_Master`). Живость Maya — pid вместе с временем создания
@@ -64,8 +71,8 @@
   этого `quit` встаёт на модальном окне «Secure UserSetup Checksum verification». Заранее
   записанный `userPrefs.mel` не помогает: первый старт Maya в новом каталоге настроек его
   игнорирует.
-* **Таймер простоя.** Забытая Maya на скрытом рабочем столе руками не закрывается: `userSetup.py`
-  раз в минуту сравнивает возраст `work/last_call` с `--ttl` и закрывает Maya. `exec` обновляет
+* **Таймер простоя.** Забытая Maya на скрытом рабочем столе руками не закрывается: таймер,
+  который запускает `inmaya.startup`, раз в минуту сравнивает возраст `work/last_call` с `--ttl` и закрывает Maya. `exec` обновляет
   `last_call` и до, и после вызова: таймер в главном потоке молчит, пока идёт вызов, и без
   обновления после долгого вызова Maya закрылась бы сразу.
 * **Сеанс `run` без `state.json`.** Maya пула живут в job object `maya-harness run` и

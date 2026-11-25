@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import os
 from collections.abc import Callable
@@ -5,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from maya_harness import process, session, slots, win32
+from maya_harness import inmaya, process, session, slots, win32
 from maya_harness.session import SessionParams, State
 
 PROJECT = "Retarget_Master"  # `_` in the name: the directory name cannot be split into a pid
@@ -193,15 +194,38 @@ def test_prepare_copies_the_package_for_the_code_in_maya(tmp_path: Path) -> None
     root = tmp_path / "session"
     env = session.prepare(root, SessionParams(PROJECT, tmp_path), module, {}, 1)
     copy = Path(env["PYTHONPATH"]) / "maya_harness"
+    assert sorted(path.name for path in copy.iterdir()) == ["__init__.py", "inmaya.py"]
     assert (copy / "inmaya.py").read_bytes() == (Path(session.__file__).parent / "inmaya.py").read_bytes()
-    assert not list(copy.rglob("__pycache__"))
+    user_setup = root / "app" / "2025" / "scripts" / "userSetup.py"
+    assert user_setup.read_text(encoding="utf-8") == session.USER_SETUP
 
 
-def test_user_setup_loads_project_plugins_then_dcc_mcp() -> None:
-    code = session.user_setup(("fbxmaya", "gameFbxExporter"))
-    compile(code, "userSetup.py", "exec")
-    assert "('fbxmaya', 'gameFbxExporter', 'dcc_mcp_maya_plugin')" in code
-    assert 'SafeModeUserSetupHashOption", 0' in code
+def test_user_setup_is_inmaya_startup() -> None:
+    compile(session.USER_SETUP, "userSetup.py", "exec")
+    assert "inmaya.startup()" in session.USER_SETUP
+
+
+def test_user_setup_writes_the_traceback_where_the_session_reads_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken() -> None:
+        raise RuntimeError("no plugin")
+
+    monkeypatch.setattr(inmaya, "startup", broken)
+    monkeypatch.setenv(inmaya.MARKER, str(tmp_path))
+    with pytest.raises(RuntimeError):
+        exec(session.USER_SETUP, {})
+    status = (tmp_path / inmaya.STARTUP).read_text(encoding="utf-8")
+    assert status.startswith("Traceback") and "no plugin" in status
+
+
+def test_environment_passes_the_plugins_and_the_ttl_to_startup() -> None:
+    env = session.environment(
+        BASE, Path("C:/s"), dataclasses.replace(PARAMS, plugins=("fbxmaya", "gameFbxExporter")), 1, 5
+    )
+    assert env[inmaya.PLUGINS] == os.pathsep.join(["fbxmaya", "gameFbxExporter"])
+    assert env[inmaya.TTL] == "5"
+    assert session.environment(BASE, Path("C:/s"), SessionParams(PROJECT, Path("C:/p")), 1)[inmaya.PLUGINS] == ""
 
 
 @pytest.mark.parametrize(

@@ -65,17 +65,13 @@ def test_exec_at_a_url_takes_its_session_when_there_is_one(monkeypatch: pytest.M
     assert cli.select("http://127.0.0.1:9/mcp") == ("http://127.0.0.1:9/mcp", None)
 
 
-def test_reload_code_drops_the_packages_and_their_submodules() -> None:
-    import sys
+def test_reload_code_calls_inmaya_reload(monkeypatch: pytest.MonkeyPatch) -> None:
+    from maya_harness import inmaya
 
-    sys.modules["fake_pkg_for_reload"] = sys
-    sys.modules["fake_pkg_for_reload.sub"] = sys
-    sys.modules["fake_pkg_for_reload_other"] = sys
-    code = cli.reload_code(["fake_pkg_for_reload"])
-    exec(code, {})
-    assert "fake_pkg_for_reload" not in sys.modules
-    assert "fake_pkg_for_reload.sub" not in sys.modules
-    assert sys.modules.pop("fake_pkg_for_reload_other") is sys
+    called: list[object] = []
+    monkeypatch.setattr(inmaya, "reload", lambda *args: called.append(args))
+    exec(cli.reload_code(["plugin", "rig"]), {})
+    assert called == [(("plugin", "rig"),)]
 
 
 def test_missing_maya_exits_with_2(

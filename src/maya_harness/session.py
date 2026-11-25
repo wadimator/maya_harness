@@ -18,14 +18,17 @@
 * `MAYA_PLUG_IN_PATH` holds the plugin's own Maya plugins: loading them from an untrusted
   directory stops at the modal «Untrusted Plugin» dialog. `DCC_MCP_MAYA_SIDECAR=0` and
   `DCC_MCP_GATEWAY_PORT=0` keep this Maya out of the user's dcc-mcp gateway.
-* The Maya is marked by `MAYA_HARNESS_WORK`, its work directory: the harness runs code only in
+* The Maya is marked by `inmaya.MARKER`, its work directory: the harness runs code only in
   a Maya with the marker, and an artist's Maya has none.
-* `pylib/` holds a copy of this package and is the last on Maya's `PYTHONPATH`, after the
-  project's `sys_path`: the code of a scenario imports `maya_harness.inmaya`. A copy, not the
-  parent of the installed package: that is the `site-packages` of the project's `.venv`, with
-  pytest, mypy and the rest.
+* `pylib/` holds a copy of `inmaya` in its package and is the last on Maya's `PYTHONPATH`,
+  after the project's `sys_path`: `userSetup.py`, the runner and the code of a scenario import
+  `maya_harness.inmaya`. A copy, not the parent of the installed package: that is the
+  `site-packages` of the project's `.venv`, with pytest, mypy and the rest. A Maya started
+  before the package was updated keeps its old `inmaya`.
+* `userSetup.py` is `inmaya.startup`: the project's Maya plugins come in `inmaya.PLUGINS`, the
+  idle minutes in `inmaya.TTL`.
 * A Maya left running and forgotten lives on a hidden desktop, where nobody can close it by
-  hand: `userSetup.py` starts a timer that quits Maya after `MAYA_HARNESS_TTL` idle minutes.
+  hand: `inmaya.startup` starts a timer that quits Maya after `inmaya.TTL` idle minutes.
   Idle is the age of `work/last_call`, which `exec` touches before and after its call: the timer
   is on Maya's main thread and is silent while a call runs there, so without the touch after
   the call a call longer than the TTL would be followed by a quit at once. Qt runs the timer
@@ -58,66 +61,29 @@ from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from . import process, slots, transport
+from . import inmaya, process, slots, transport
 from .process import maya_alive, process_alive
 
 PREFIX = "maya_harness_"
 NUMBERS = itertools.count(1)  # of the Mayas `start` starts: each gets a desktop of its own
 STATE_FILE = "state.json"
-MARKER = "MAYA_HARNESS_WORK"
 PROJECT_VARIABLE = "MAYA_HARNESS_PROJECT"
 MODULE_VARIABLE = "MAYA_HARNESS_DCC_MCP_MOD"
 DEFAULT_MAYA = Path(r"C:\Program Files\Autodesk\Maya2025")
 UNCLAIMED_AGE = 24 * 60 * 60  # seconds a directory without a readable state.json is kept
 DROPPED = ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "VIRTUAL_ENV")
 
-USER_SETUP = """
-import os, traceback
+# The session's `userSetup.py`: `inmaya.startup`, its traceback in `inmaya.STARTUP` on an error.
+USER_SETUP = """import os, traceback
 from pathlib import Path
 
-import maya.cmds as cmds
-
-_status = Path(os.environ["MAYA_HARNESS_WORK"]) / "startup.txt"
-_status.write_text("userSetup.py loaded", encoding="utf-8")
-cmds.optionVar(intValue=("SafeModeUserSetupHashOption", 0))
-
-_last_call = Path(os.environ["MAYA_HARNESS_WORK"]) / "last_call"
-_last_call.touch()
-_ttl = int(os.environ.get("MAYA_HARNESS_TTL") or 0)
-
-
-def _maya_harness_quit_when_idle():
-    import time
-
-    try:
-        idle = time.time() - _last_call.stat().st_mtime
-    except OSError:
-        return
-    if idle > _ttl * 60:
-        cmds.quit(force=True)
-
-
-def _maya_harness_start_idle_timer():
-    import __main__
-    from PySide6.QtCore import QTimer
-
-    timer = QTimer()
-    timer.timeout.connect(_maya_harness_quit_when_idle)
-    timer.start(60 * 1000)
-    __main__._maya_harness_idle_timer = timer  # a timer nobody holds is collected and stops
-
-
-if _ttl > 0:
-    cmds.evalDeferred(_maya_harness_start_idle_timer)
-
 try:
-    for _plugin in {plugins!r}:
-        cmds.loadPlugin(_plugin, quiet=True)
+    from maya_harness import inmaya
+
+    inmaya.startup()
 except BaseException:
-    _status.write_text(traceback.format_exc(), encoding="utf-8")
+    (Path(os.environ["MAYA_HARNESS_WORK"]) / "startup.txt").write_text(traceback.format_exc(), encoding="utf-8")
     raise
-else:
-    _status.write_text("dcc_mcp_maya_plugin loaded", encoding="utf-8")
 """
 
 
@@ -378,18 +344,17 @@ def environment(base: Mapping[str, str], root: Path, params: SessionParams, port
         DCC_MCP_MAYA_PORT=str(port),
         DCC_MCP_MAYA_BOOTSTRAP_LOG=str(work / "dcc_mcp_bootstrap.jsonl"),
         PYTHONUTF8="1",
-        MAYA_HARNESS_TTL=str(ttl),
-        **{MARKER: str(work), PROJECT_VARIABLE: params.project},
+        **{
+            inmaya.MARKER: str(work),
+            inmaya.PLUGINS: os.pathsep.join(params.plugins),
+            inmaya.TTL: str(ttl),
+            PROJECT_VARIABLE: params.project,
+        },
     )
     env["PYTHONPATH"] = os.pathsep.join(str(path) for path in (*params.sys_path, root / "pylib"))
     if params.plug_in_path:
         env["MAYA_PLUG_IN_PATH"] = os.pathsep.join(str(path) for path in params.plug_in_path)
     return env
-
-
-def user_setup(plugins: tuple[str, ...]) -> str:
-    """`userSetup.py` of the session: the project's Maya plugins, then dcc-mcp."""
-    return USER_SETUP.format(plugins=(*plugins, "dcc_mcp_maya_plugin"))
 
 
 def prepare(
@@ -398,14 +363,17 @@ def prepare(
     """Fills `root` with the session's settings; returns the environment its Maya starts with."""
     scripts = root / "app" / "2025" / "scripts"
     scripts.mkdir(parents=True)
-    (scripts / "userSetup.py").write_text(user_setup(params.plugins), encoding="utf-8")
+    (scripts / "userSetup.py").write_text(USER_SETUP, encoding="utf-8")
     modules = root / "modules"
     modules.mkdir()
     shutil.copy(module, modules / module.name)  # its paths are absolute
     (root / "work").mkdir()
     (root / "appdata").mkdir()
     package = Path(__file__).resolve().parent
-    shutil.copytree(package, root / "pylib" / package.name, ignore=shutil.ignore_patterns("__pycache__"))
+    copy = root / "pylib" / package.name
+    copy.mkdir(parents=True)
+    for name in ("__init__.py", "inmaya.py"):  # all that Maya imports of the package
+        shutil.copy(package / name, copy / name)
     return environment(base, root, params, port, ttl)
 
 

@@ -189,10 +189,7 @@ def select(url: str | None) -> tuple[str, Record | None]:
 def reload_code(packages: Sequence[str]) -> str:
     """Drops `packages` and their submodules from `sys.modules`, so the code imports them from disk."""
     return (
-        "import sys as _maya_harness_sys\n"
-        "for _maya_harness_name in tuple(_maya_harness_sys.modules):\n"
-        f"    if _maya_harness_name.split('.')[0] in {tuple(packages)!r}:\n"
-        "        del _maya_harness_sys.modules[_maya_harness_name]\n"
+        f"from maya_harness import inmaya as _maya_harness_inmaya\n_maya_harness_inmaya.reload({tuple(packages)!r})\n"
     )
 
 

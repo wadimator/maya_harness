@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from maya_harness import cli, config, session, slots, win32
+from maya_harness import cli, config, inmaya, session, slots, win32
 from maya_harness import run as scenario_run
 from maya_harness.run import Run
 
@@ -142,14 +142,13 @@ def test_parse_refuses_parameters_of_several_runs(argv: list[str]) -> None:
         scenario_run.parse(argv, ALL)
 
 
-def test_code_drops_the_scenarios_and_the_reload_packages(project: Path) -> None:
+def test_code_runs_the_scenario_through_inmaya(project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     code = scenario_run.code_of(Run("check_bake", {"control": "no_round"}, "x"), project / "checks", ("plugin",))
-    compile(code, "run", "exec")
-    assert repr(str(project / "checks")) in code
-    assert "in ('plugin',) or _name.startswith('check_')" in code
-    assert code.rstrip().endswith(
-        "json.dumps(check_bake.run(**{'control': 'no_round'}), ensure_ascii=False, default=str)"
-    )
+    called: list[object] = []
+    monkeypatch.setattr(inmaya, "run_scenario", lambda *args: called.append(args) or "{}")
+    exec(code, {})
+    assert called == [(str(project / "checks"), "check_bake", {"control": "no_round"}, ("plugin",))]
+    assert code.rstrip().splitlines()[-1].startswith("_maya_harness_inmaya.run_scenario(")  # the report is its value
 
 
 @pytest.mark.parametrize(
