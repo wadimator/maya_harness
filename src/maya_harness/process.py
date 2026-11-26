@@ -142,7 +142,7 @@ def window_titles(pid: int, desktop: object = None) -> list[str]:
     """The visible windows of process `pid` that have a title (Maya has visible ones without),
     on `desktop`; without it, on every hidden desktop of maya_harness and on the current one:
     the Maya of another harness process is on a desktop this one did not make."""
-    return [title for _, title in _windows(pid, desktop)]
+    return [title for title, _ in _windows(pid, desktop)]
 
 
 def modal_dialog(pid: int, desktop: object = None) -> list[str]:
@@ -153,16 +153,19 @@ def modal_dialog(pid: int, desktop: object = None) -> list[str]:
     `time.sleep`, an open Script Editor, `cmds.progressWindow`, the main progress bar and the
     opening of a 422 MB scene leave it enabled: a busy Maya is not taken for one on a dialog.
     `confirmDialog` disables it some 0.25 s before the dialog gets its title: a disabled window
-    with no other titled one is [] too, and the next look finds the dialog with its title."""
+    with no other titled one is [] too, and the next look finds the dialog with its title.
+    Maya's in-view message is two untitled Qt windows, titled `Maya-2025` by Windows, for some 4 s
+    after a call: with the main window enabled they are no dialog."""
     windows = _windows(pid, desktop)
-    main = [window for window, title in windows if MAIN_TITLE in title]
-    if not main or any(win32.user32.IsWindowEnabled(window) for window in main):
+    main = [enabled for title, enabled in windows if MAIN_TITLE in title]
+    if not main or any(main):
         return []
-    return [title for window, title in windows if window not in main]
+    return [title for title, _ in windows if MAIN_TITLE not in title]
 
 
-def _windows(pid: int, desktop: object) -> list[tuple[int, str]]:
-    """The visible titled windows of `pid` and their titles; the desktops as in `window_titles`."""
+def _windows(pid: int, desktop: object) -> list[tuple[str, bool]]:
+    """The titles of the visible titled windows of `pid`, and whether each is enabled; the desktops
+    as in `window_titles`."""
     if desktop is not None:
         return _titles_on(desktop, pid)
     names: list[str] = []
@@ -182,8 +185,8 @@ def _windows(pid: int, desktop: object) -> list[tuple[int, str]]:
     return titles
 
 
-def _titles_on(desktop: object, pid: int) -> list[tuple[int, str]]:
-    titles: list[tuple[int, str]] = []
+def _titles_on(desktop: object, pid: int) -> list[tuple[str, bool]]:
+    titles: list[tuple[str, bool]] = []
 
     def collect(window: int, _: int) -> bool:
         owner = wintypes.DWORD()
@@ -191,7 +194,9 @@ def _titles_on(desktop: object, pid: int) -> list[tuple[int, str]]:
         if owner.value == pid and win32.user32.IsWindowVisible(window) and win32.user32.GetWindowTextLengthW(window):
             title = ctypes.create_unicode_buffer(512)
             win32.user32.GetWindowTextW(window, title, len(title))
-            titles.append((window, title.value))
+            # Read here, while the desktop handle is open: after `CloseDesktop` a window on the
+            # desktop of another process reads as disabled (`IsWindowEnabled` fails, error 1400).
+            titles.append((title.value, bool(win32.user32.IsWindowEnabled(window))))
         return True
 
     win32.user32.EnumDesktopWindows(desktop, win32.WNDENUMPROC(collect), 0)

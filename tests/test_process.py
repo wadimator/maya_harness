@@ -111,17 +111,51 @@ def test_modal_dialog_is_the_other_windows_while_the_main_window_is_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A dialog that has no title yet is not one: `confirmDialog` disables the window first."""
-    main = (1, "untitled - Autodesk MAYA 2025.3.1: untitled")
-    windows = [main]
-    enabled = [True]
+    title = "untitled - Autodesk MAYA 2025.3.1: untitled"
+    windows = [(title, True)]
     monkeypatch.setattr(process, "_windows", lambda pid, desktop: windows)
-    monkeypatch.setattr(win32.user32, "IsWindowEnabled", lambda window: enabled[0])
-    windows.append((2, "Script Editor"))
+    windows.append(("Script Editor", True))
     assert process.modal_dialog(10) == []
-    enabled[0] = False
-    windows.remove((2, "Script Editor"))
+    windows[:] = [(title, False)]
     assert process.modal_dialog(10) == []
-    windows.append((3, "Untrusted Plugin Loading - Security Warning"))
+    windows.append(("Untrusted Plugin Loading - Security Warning", True))
     assert process.modal_dialog(10) == ["Untrusted Plugin Loading - Security Warning"]
-    windows.remove(main)
+    windows.pop(0)
     assert process.modal_dialog(10) == []
+
+
+ON_A_DESKTOP = """
+import ctypes, os, sys
+from ctypes import wintypes as w
+user32 = ctypes.WinDLL("user32")
+user32.CreateDesktopW.restype = w.HANDLE
+user32.CreateWindowExW.restype = w.HWND
+user32.CreateWindowExW.argtypes = [w.DWORD, w.LPCWSTR, w.LPCWSTR, w.DWORD] + [ctypes.c_int] * 4 + [ctypes.c_void_p] * 4
+user32.EnableWindow.argtypes = [w.HWND, w.BOOL]
+desktop = user32.CreateDesktopW(f"maya_harness_test_{os.getpid()}", None, None, 0, 0x10000000, None)
+assert user32.SetThreadDesktop(w.HANDLE(desktop))
+def window(title):
+    return user32.CreateWindowExW(0, "STATIC", title, 0x10000000, 0, 0, 9, 9, None, None, None, None)
+main = window("untitled - Autodesk MAYA 2025")
+window("Maya-2025")
+print(flush=True)
+sys.stdin.readline()
+user32.EnableWindow(main, False)
+print(flush=True)
+sys.stdin.readline()
+"""
+
+
+def test_modal_dialog_reads_the_main_window_on_a_desktop_of_another_process(
+    stub: Callable[..., subprocess.Popen[str]],
+) -> None:
+    """Windows on a desktop of another process, as Maya's of `start`: the harness opens and
+    closes that desktop to list them."""
+    child = stub(ON_A_DESKTOP, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    assert child.stdin and child.stdout
+    assert child.stdout.readline() == "\n"  # the windows are on its desktop
+    assert process.modal_dialog(child.pid) == []
+    child.stdin.write("\n")
+    child.stdin.flush()
+    child.stdout.readline()
+    assert process.modal_dialog(child.pid) == ["Maya-2025"]
