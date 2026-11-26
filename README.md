@@ -36,7 +36,7 @@ dev = [
 ]
 
 [tool.uv.sources]
-maya-harness = { url = "https://github.com/wadimator/maya_harness/releases/download/v0.7.0/maya_harness-0.7.0-py3-none-any.whl" }
+maya-harness = { url = "https://github.com/wadimator/maya_harness/releases/download/v0.7.1/maya_harness-0.7.1-py3-none-any.whl" }
 ```
 
 Затем `uv lock` и `uv sync`. Git-источник (`{ git = "..." }`) не подходит: uv собирает его из
